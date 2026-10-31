@@ -32,11 +32,15 @@ movie into a project.
 ```bash
 ./scripts/build-app.sh    # ad-hoc signed app in build/ScreenForge.app
 ./scripts/run.sh          # build + launch
+./scripts/run.sh --logs   # build + launch, logging to build/screenforge.log
 ./scripts/test-xcode.sh   # 79 tests incl. Metal, SwiftUI, export, playback
 
 swift build               # core library, Command Line Tools only
 ./scripts/test.sh         # core tests, no Xcode required
 ```
+
+Manual end-to-end checklist, permission reset, and diagnostics:
+[`docs/TESTING.md`](docs/TESTING.md) · `./scripts/diagnostics.sh`.
 
 If `xcodebuild` cannot find Xcode, run `sudo xcode-select -s /Applications/Xcode.app`;
 the scripts also detect `/Applications/Xcode.app` automatically.

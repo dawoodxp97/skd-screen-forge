@@ -95,7 +95,8 @@ struct MetalCompositorTests {
     @Test("Cursor, annotation, and caption textures rasterize")
     func textures() throws {
         guard isHosted, let device = MTLCreateSystemDefaultDevice() else { return }
-        let compositor = try Compositor(device: device)
+        // The pipelines must build before any texture work is useful.
+        _ = try Compositor(device: device)
 
         let cursor = try #require(CursorTextureFactory.makeTexture(for: .filledArrow, device: device))
         #expect(cursor.width == CursorTextureFactory.textureSize)

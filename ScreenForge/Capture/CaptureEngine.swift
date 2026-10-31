@@ -329,6 +329,12 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
     private var pendingPauseStartMs: Int?
     private var manifest: RecordingManifest
     private var pendingRotations: [AVAssetWriter] = []
+    /// Samples held while the hardware encoder catches up. Bounded so a stalled encoder
+    /// cannot grow memory without limit.
+    private var pendingVideo: [CMSampleBuffer] = []
+    private var pendingAudio: [CMSampleBuffer] = []
+    private var drainScheduled = false
+    private let maximumPendingSamples = 240
 
     init(
         outputURL: URL,
@@ -377,17 +383,60 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
             self.lastPresentationTime = pts
             self.ensureWriter(at: pts)
             self.rotateIfNeeded(at: pts)
-            guard let input = self.videoInput, input.isReadyForMoreMediaData else { return }
-            input.append(buffer)
+
+            self.pendingVideo.append(buffer)
+            if self.pendingVideo.count > self.maximumPendingSamples {
+                self.pendingVideo.removeFirst()
+            }
+            self.drainPending()
         }
     }
 
     func appendAudio(_ sampleBuffer: CMSampleBuffer) {
         nonisolated(unsafe) let buffer = sampleBuffer
         queue.async { [weak self] in
-            guard let self, let input = self.audioInput, input.isReadyForMoreMediaData else { return }
-            input.append(buffer)
+            guard let self else { return }
+            self.pendingAudio.append(buffer)
+            if self.pendingAudio.count > self.maximumPendingSamples {
+                self.pendingAudio.removeFirst()
+            }
+            self.drainPending()
         }
+    }
+
+    /// Drains buffered samples as the encoder accepts them. Frames are no longer dropped
+    /// the instant `isReadyForMoreMediaData` is false, which matters at 4K60.
+    private func drainPending() {
+        if let video = videoInput {
+            while video.isReadyForMoreMediaData, !pendingVideo.isEmpty {
+                video.append(pendingVideo.removeFirst())
+            }
+        }
+        if let audio = audioInput {
+            while audio.isReadyForMoreMediaData, !pendingAudio.isEmpty {
+                audio.append(pendingAudio.removeFirst())
+            }
+        }
+        guard !pendingVideo.isEmpty || !pendingAudio.isEmpty else { return }
+        guard !drainScheduled else { return }
+        drainScheduled = true
+        queue.asyncAfter(deadline: .now() + .milliseconds(4)) { [weak self] in
+            guard let self else { return }
+            self.drainScheduled = false
+            self.drainPending()
+        }
+    }
+
+    /// Blocks briefly so the current segment is not closed with buffered frames pending.
+    private func flushPending(deadlineMs: Int = 250) {
+        let deadline = DispatchTime.now() + .milliseconds(deadlineMs)
+        while !pendingVideo.isEmpty || !pendingAudio.isEmpty {
+            drainPending()
+            if DispatchTime.now() > deadline { break }
+            usleep(2_000)
+        }
+        pendingVideo.removeAll()
+        pendingAudio.removeAll()
     }
 
     // MARK: Rotation
@@ -415,6 +464,7 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
         guard let oldWriter = writer, let oldURL = currentSegmentURL else { return }
 
         // Close the current segment.
+        flushPending()
         videoInput?.markAsFinished()
         audioInput?.markAsFinished()
         let startMs = Int((CMTimeGetSeconds(segmentStartTime ?? .zero) * 1000).rounded())
@@ -498,12 +548,13 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
                 }
             }
 
+            // Must be set before writing starts; setting it later raises.
+            // Fragmentation keeps a crashed recording readable.
+            writer.movieFragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
+
             guard writer.startWriting() else {
                 throw CaptureError.writerSetupFailed(writer.error?.localizedDescription ?? "startWriting failed")
             }
-            // Fragment the file so a crash leaves a readable movie instead of a
-            // headerless file that AVFoundation cannot open.
-            writer.movieFragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
             writer.startSession(atSourceTime: pts)
 
             if let pauseStart = pendingPauseStartMs {
@@ -554,6 +605,7 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
                     return
                 }
                 if let writer = self.writer, let url = self.currentSegmentURL {
+                    self.flushPending()
                     self.videoInput?.markAsFinished()
                     self.audioInput?.markAsFinished()
                     let startMs = Int((CMTimeGetSeconds(self.segmentStartTime ?? .zero) * 1000).rounded())

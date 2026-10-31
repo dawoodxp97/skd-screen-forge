@@ -31,7 +31,8 @@ struct ProjectImporterTests {
         writer.startSession(atSourceTime: .zero)
         let pool = try #require(adaptor.pixelBufferPool)
         let frames = max(Int(seconds * 30), 1)
-        for frame in 0..<frames where input.isReadyForMoreMediaData {
+        for frame in 0..<frames {
+            while !input.isReadyForMoreMediaData { usleep(500) }
             var buffer: CVPixelBuffer?
             CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
             let pixelBuffer = try #require(buffer)

@@ -1,0 +1,31 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+
+# macOS
+.DS_Store
+*.dSYM
+*.dSYM.zip
+
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# App artifacts
+*.dmg
+*.pkg
+*.app
+*.sforge
+
+# Local recordings / fixtures
+Recordings/
+Fixtures/Local/
+
+# Env
+.env
+.env.*

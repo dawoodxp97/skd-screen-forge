@@ -1,0 +1,92 @@
+name: ScreenForge
+options:
+  bundleIdPrefix: studio.screenforge
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: NO
+    GCC_TREAT_WARNINGS_AS_ERRORS: NO
+targets:
+  ScreenForge:
+    type: application
+    platform: macOS
+    sources:
+      - path: ScreenForge
+    resources:
+      - path: ScreenForge/Resources
+    info:
+      path: ScreenForge/App/Info.plist
+      properties:
+        CFBundleDisplayName: ScreenForge
+        CFBundleName: ScreenForge
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSMinimumSystemVersion: "14.0"
+        LSApplicationCategoryType: public.app-category.video
+        NSHighResolutionCapable: true
+        NSSupportsAutomaticGraphicsSwitching: true
+        NSMicrophoneUsageDescription: ScreenForge records your microphone for voiceover and captions.
+        NSCameraUsageDescription: ScreenForge records your camera for picture-in-picture and camera layouts.
+        NSSpeechRecognitionUsageDescription: ScreenForge transcribes your voice on-device to generate captions and enable transcript editing.
+        NSAudioCaptureUsageDescription: ScreenForge captures system audio so your recordings include app sound.
+        NSHumanReadableCopyright: "© 2026 ScreenForge"
+        LSMultipleInstancesProhibited: true
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: ScreenForge Project
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - studio.screenforge.project
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: studio.screenforge.project
+            UTTypeDescription: ScreenForge Project
+            UTTypeConformsTo:
+              - com.apple.package
+              - com.apple.bundle
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - sforge
+    entitlements:
+      path: ScreenForge/App/ScreenForge.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.device.audio-input: true
+        com.apple.security.device.camera: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.files.downloads.read-write: true
+        com.apple.security.network.client: true
+        com.apple.security.personal-information.speech-recognition: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: studio.screenforge.app
+        PRODUCT_NAME: ScreenForge
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: ScreenForge/App/ScreenForge.entitlements
+        ENABLE_APP_SANDBOX: YES
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    scheme:
+      testTargets:
+        - ScreenForgeTests
+  ScreenForgeTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: ScreenForge
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: studio.screenforge.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ScreenForge.app/Contents/MacOS/ScreenForge"
+        BUNDLE_LOADER: "$(TEST_HOST)"

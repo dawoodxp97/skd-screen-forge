@@ -501,6 +501,9 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
             guard writer.startWriting() else {
                 throw CaptureError.writerSetupFailed(writer.error?.localizedDescription ?? "startWriting failed")
             }
+            // Fragment the file so a crash leaves a readable movie instead of a
+            // headerless file that AVFoundation cannot open.
+            writer.movieFragmentInterval = CMTime(seconds: 2, preferredTimescale: 600)
             writer.startSession(atSourceTime: pts)
 
             if let pauseStart = pendingPauseStartMs {

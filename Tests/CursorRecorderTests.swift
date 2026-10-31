@@ -38,6 +38,32 @@ struct CursorRecorderTests {
         #expect(decoded.count >= 1)
     }
 
+    @Test("The first click after idle does not overflow the click sentinel")
+    func firstClick() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgeCursor-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let recorder = CursorRecorder()
+        try recorder.start(
+            configuration: CursorRecorder.Configuration(
+                displayID: CGMainDisplayID(),
+                sampleIntervalMs: 8,
+                hideSystemCursor: false
+            ),
+            outputURL: directory.appendingPathComponent("cursor.jsonl")
+        )
+
+        // Previously `nowMs - Int.min` trapped here (crash report: CursorRecorder:223).
+        recorder.poll(location: CGPoint(x: 420, y: 320), left: true, right: false, other: false)
+        recorder.poll(location: CGPoint(x: 424, y: 322), left: false, right: false, other: false)
+
+        let samples = recorder.stop()
+        #expect(samples.contains { $0.interaction == .click })
+        #expect(samples.count >= 2)
+    }
+
     @Test("Samples are normalized inside the configured window bounds")
     func windowBounds() async throws {
         let directory = FileManager.default.temporaryDirectory

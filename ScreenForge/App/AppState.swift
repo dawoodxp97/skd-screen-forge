@@ -115,7 +115,7 @@ public final class AppState: ObservableObject {
         didAttemptRecovery = true
 
         let output = RecordingSession.defaultOutputDirectory
-        guard !RecordingRecovery.recoverableSessions(in: output).isEmpty else { return }
+        guard !(await RecordingRecovery.recoverableSessions(in: output)).isEmpty else { return }
 
         let recovered = await RecordingRecovery.recoverAll(in: output)
         guard !recovered.isEmpty else { return }

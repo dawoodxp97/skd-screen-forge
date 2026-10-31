@@ -95,7 +95,7 @@ struct RecordingRecoveryTests {
             options: .atomic
         )
 
-        let orphans = RecordingRecovery.recoverableSessions(in: output)
+        let orphans = await RecordingRecovery.recoverableSessions(in: output)
         #expect(orphans.count == 1)
         #expect(orphans[0].manifest.displayName == "Demo")
 
@@ -113,12 +113,57 @@ struct RecordingRecoveryTests {
         #expect(cursors.count == 2)
 
         // The session is consumed, so a second pass finds nothing.
-        #expect(RecordingRecovery.recoverableSessions(in: output).isEmpty)
+        #expect(await RecordingRecovery.recoverableSessions(in: output).isEmpty)
         #expect(!FileManager.default.fileExists(atPath: session.path))
     }
 
+    @Test("Segments missing from the manifest are still recovered")
+    func recoversUnlistedSegment() async throws {
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgeRecovery-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        let session = RecordingRecovery.sessionsDirectory(in: output)
+            .appendingPathComponent("Crash", isDirectory: true)
+        try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+
+        // The manifest was written before the segment finished; the file exists on disk.
+        let segmentName = "screen.seg-0001.mov"
+        try writeSegment(to: session.appendingPathComponent(segmentName), seconds: 0.8)
+
+        let manifest = RecordingManifest(
+            sessionID: UUID(),
+            displayName: "Crash",
+            pixelWidth: 160,
+            pixelHeight: 160,
+            scale: 1,
+            fps: 30,
+            hasSystemAudio: false,
+            hasMicrophone: false,
+            segments: [],
+            state: .recording
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(manifest).write(
+            to: session.appendingPathComponent("screen.manifest.json"),
+            options: .atomic
+        )
+
+        let orphans = await RecordingRecovery.recoverableSessions(in: output)
+        #expect(orphans.count == 1)
+        #expect(orphans[0].manifest.segments.map(\.fileName) == [segmentName])
+
+        let recovered = await RecordingRecovery.recoverAll(in: output)
+        #expect(recovered.count == 1)
+
+        let bundle = try #require(recovered.first)
+        let project = try await ProjectStore.shared.load(from: bundle)
+        #expect(abs(project.source.durationMs - 800) < 120)
+    }
+
     @Test("Sessions without segments are not offered for recovery")
-    func skipsEmptySessions() throws {
+    func skipsEmptySessions() async throws {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScreenForgeRecovery-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: output) }
@@ -145,6 +190,6 @@ struct RecordingRecoveryTests {
             options: .atomic
         )
 
-        #expect(RecordingRecovery.recoverableSessions(in: output).isEmpty)
+        #expect(await RecordingRecovery.recoverableSessions(in: output).isEmpty)
     }
 }

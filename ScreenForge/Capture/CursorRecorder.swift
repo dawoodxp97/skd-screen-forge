@@ -65,8 +65,9 @@ public final class CursorRecorder: @unchecked Sendable {
     private var configuration: Configuration?
     private var displayBounds: CGRect = .zero
     private var startHostSeconds: Double = 0
-    private var lastMoveMs: Int = -.max
-    private var lastClickMs: Int = -.max
+    /// Sentinels are half of `Int.min` so `now - sentinel` cannot overflow.
+    private var lastMoveMs: Int = Int.min / 2
+    private var lastClickMs: Int = Int.min / 2
     private var lastPosition = CGPoint(x: 0.5, y: 0.5)
     private var leftDown = false
     private var rightDown = false
@@ -121,8 +122,8 @@ public final class CursorRecorder: @unchecked Sendable {
         self.configuration = configuration
         self.displayBounds = bounds
         self.startHostSeconds = CACurrentMediaTime()
-        self.lastMoveMs = -.max
-        self.lastClickMs = -.max
+        self.lastMoveMs = Int.min / 2
+        self.lastClickMs = Int.min / 2
         self.samples.removeAll(keepingCapacity: true)
         self.flushedCount = 0
         self.isRecording = true
@@ -197,7 +198,8 @@ public final class CursorRecorder: @unchecked Sendable {
         CGEventSource.buttonState(.combinedSessionState, button: button)
     }
 
-    private func poll(location: CGPoint, left: Bool, right: Bool, other: Bool) {
+    /// Internal for tests (the poll timer calls it on a background queue).
+    func poll(location: CGPoint, left: Bool, right: Bool, other: Bool) {
         lock.lock()
         guard isRecording, let configuration else {
             lock.unlock()

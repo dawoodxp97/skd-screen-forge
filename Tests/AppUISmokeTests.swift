@@ -146,6 +146,73 @@ struct AppUISmokeTests {
         #expect(writer.status == .completed)
     }
 
+    @Test("Editing the project repaints the preview")
+    func previewRepaintsOnEdit() async throws {
+        guard isHosted else { return }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgeRepaint-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let movie = directory.appendingPathComponent("repaint.mov")
+        try writeMovie(to: movie, seconds: 1.0, size: 240)
+
+        let bundle = directory.appendingPathComponent("repaint.sforge", isDirectory: true)
+        let store = ProjectStore.shared
+        try await store.createBundle(at: bundle)
+        try await store.importMedia(from: movie, into: bundle, preferredName: "screen.mov")
+        let project = ScreenForgeProject(
+            source: SourceInfo(
+                screenPath: "media/screen.mov",
+                durationMs: 1_000,
+                pixelWidth: 240,
+                pixelHeight: 240
+            )
+        )
+        try await store.save(project, to: bundle)
+
+        let app = AppState()
+        let document = ProjectDocument(
+            bundleURL: bundle,
+            project: project,
+            cursorSamples: [],
+            compositor: app.compositor
+        )
+
+        let hosting = NSHostingView(
+            rootView: EditorView(document: document)
+                .environmentObject(app)
+                .frame(width: 1_320, height: 860)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1_320, height: 860),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = hosting
+        window.setFrameOrigin(NSPoint(x: -20_000, y: -20_000))
+        window.orderBack(nil)
+        defer { window.close() }
+
+        hosting.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(900))
+        hosting.layoutSubtreeIfNeeded()
+        let initial = PreviewView.Coordinator.drawCount
+        #expect(initial > 0, "preview never drew")
+
+        document.apply { project in
+            project.canvas.background = BackgroundStyle(kind: .solid, colors: ["#FF0000"])
+            project.canvas.padding = 0.2
+        }
+        try await Task.sleep(for: .milliseconds(700))
+
+        let after = PreviewView.Coordinator.drawCount
+        #expect(after > initial, "editing the project did not repaint the preview")
+    }
+
     // MARK: - Rendering
 
     /// SwiftUI builds its content once the hosting view is attached to a window, so

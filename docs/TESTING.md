@@ -185,8 +185,8 @@ These are documented in [`STATUS.md`](STATUS.md) and are not implemented yet:
 Also expected:
 
 - Screen Recording requires a **relaunch** after granting it.
-- Cursor telemetry requires **Accessibility**; without it, recordings are still made with
-  cursor effects disabled.
+- Cursor telemetry is polled and needs no permission; **Accessibility** only adds
+  scroll-wheel samples.
 - The first camera/speech use triggers a system prompt; denying falls back gracefully.
 - Ad-hoc signing: macOS may warn the first time you open the app; `./scripts/run.sh` from
   the same machine avoids Gatekeeper prompts.

@@ -128,7 +128,10 @@ struct EditorView: View {
                     .font(.system(size: 12, weight: .medium))
             }
             .buttonStyle(SecondaryButtonStyle())
-            .help("Generate zooms from cursor activity")
+            .disabled(!document.hasCursorTelemetry)
+            .help(document.hasCursorTelemetry
+                  ? "Generate zooms from cursor activity"
+                  : "No cursor telemetry in this recording")
 
             Button {
                 document.addZoomAtPlayhead(outputMs: playback.outputTimeMs)
@@ -228,22 +231,26 @@ struct EditorView: View {
             }
 
             if let error = playback.errorMessage {
-                VStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(Theme.warning)
-                    Text("Preview unavailable")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Theme.textPrimary)
-                    Text(error)
-                        .font(.system(size: 10))
-                        .foregroundStyle(Theme.textTertiary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 320)
-                    Button("Try again") { reloadPlayback() }
-                        .buttonStyle(SecondaryButtonStyle())
+                // Keep the canvas visible: media problems must not block styling edits.
+                VStack {
+                    Spacer()
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.warning)
+                        Text("Video unavailable: \(error)")
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.textSecondary)
+                            .lineLimit(2)
+                        Button("Retry") { reloadPlayback() }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.bottom, 18)
                 }
-                .padding(18)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
             }
 
             VStack {
@@ -303,6 +310,26 @@ struct EditorView: View {
                 .foregroundStyle(Theme.textTertiary)
 
             Spacer()
+
+            if let notice = document.notice {
+                HStack(spacing: 6) {
+                    Text(notice)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1)
+                    Button {
+                        document.notice = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Theme.accent.opacity(0.12)))
+            }
 
             Text(timeLabel(playback.durationMs))
                 .font(.system(size: 10, weight: .medium, design: .monospaced))

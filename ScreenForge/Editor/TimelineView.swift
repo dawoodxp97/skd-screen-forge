@@ -116,7 +116,10 @@ struct TimelineView: View {
                 Image(systemName: "wand.and.stars")
             }
             .buttonStyle(TimelineIconButtonStyle())
-            .help("Generate zooms from cursor activity")
+            .disabled(!document.hasCursorTelemetry)
+            .help(document.hasCursorTelemetry
+                  ? "Generate zooms from cursor activity"
+                  : "No cursor telemetry in this recording")
 
             Menu {
                 Button("Trim everything before playhead") {

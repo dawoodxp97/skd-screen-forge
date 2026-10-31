@@ -263,8 +263,7 @@ public final class AppState: ObservableObject {
         _ = CursorRecorder.requestAccessibilityPermission()
         refreshPermissions()
         if !accessibilityPermission {
-            recordsCursor = false
-            statusMessage = "Cursor effects need Accessibility access. Recording will continue without synthetic cursor telemetry."
+            statusMessage = "Cursor tracking works without Accessibility; granting it adds scroll-wheel events and higher-fidelity input."
         }
     }
 
@@ -289,9 +288,6 @@ public final class AppState: ObservableObject {
         if recordsMicrophone && !microphonePermission {
             await requestMicrophonePermission()
             guard microphonePermission else { return }
-        }
-        if recordsCursor && !accessibilityPermission {
-            requestAccessibilityPermission()
         }
         if recordsCamera && !cameraPermission {
             await requestCameraPermission()
@@ -340,7 +336,7 @@ public final class AppState: ObservableObject {
                 recordsCamera: recordsCamera && cameraPermission,
                 cameraDeviceID: nil,
                 hideSystemCursor: true,
-                recordsCursor: recordsCursor && accessibilityPermission,
+                recordsCursor: recordsCursor,
                 outputDirectory: RecordingSession.defaultOutputDirectory,
                 enableVoiceProcessing: true
             ))

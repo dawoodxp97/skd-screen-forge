@@ -239,7 +239,7 @@ struct CaptureOptionsView: View {
                 OptionRow(
                     icon: "cursorarrow.motionlines",
                     title: "Cursor effects",
-                    detail: app.accessibilityPermission ? "Synthetic cursor, clicks, smoothing" : "Accessibility permission required",
+                    detail: "Synthetic cursor, clicks, smoothing",
                     isOn: $app.recordsCursor
                 )
                 Divider().overlay(Theme.stroke)
@@ -372,7 +372,7 @@ struct PermissionsView: View {
                 PermissionRow(
                     icon: "cursorarrow.click",
                     title: "Accessibility",
-                    detail: "Reads cursor position and clicks",
+                    detail: "Optional: adds scroll events to the cursor log",
                     granted: app.accessibilityPermission || !app.recordsCursor
                 ) {
                     app.requestAccessibilityPermission()

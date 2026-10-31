@@ -18,16 +18,22 @@ public enum MicrophoneError: LocalizedError, Sendable {
     }
 }
 
-/// Records the microphone to compressed AAC (`.m4a`) while publishing a live level.
+/// Records the microphone to a lossless `.caf` (32-bit float PCM) while publishing a live
+/// level. The recording is converted to AAC when the project is finalized.
 ///
-/// Voice processing (AEC/AGC) is enabled when available; the heavier noise-reduction
-/// chain lives in the export-time `VoiceEnhancer` so previews stay cheap.
+/// The output file is opened lazily from the **first actual tap buffer** rather than from
+/// the input node's format before the engine starts. Voice processing can change the
+/// sample rate/channel count after `setVoiceProcessingEnabled`, and writing a 48 kHz
+/// buffer into a file opened as 44.1 kHz fails with `paramErr` (-50) on every buffer —
+/// which previously produced an empty microphone track.
 public final class MicrophoneRecorder: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let lock = NSLock()
     private var file: AVAudioFile?
+    private var fileURL: URL?
     private var level: Float = 0
     private var running = false
+    private var loggedWriteFailure = false
 
     public init() {}
 
@@ -49,6 +55,13 @@ public final class MicrophoneRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return level
+    }
+
+    /// URL of the file being written (`.caf`).
+    public var outputURL: URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        return fileURL
     }
 
     public func start(url: URL, enableVoiceProcessing: Bool = true) throws {
@@ -77,56 +90,20 @@ public final class MicrophoneRecorder: @unchecked Sendable {
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: format.sampleRate,
-            AVNumberOfChannelsKey: Int(min(format.channelCount, 2)),
-            AVEncoderBitRateKey: 128_000
-        ]
-
-        let audioFile: AVAudioFile
-        do {
-            audioFile = try AVAudioFile(
-                forWriting: url,
-                settings: settings,
-                commonFormat: .pcmFormatFloat32,
-                interleaved: false
-            )
-        } catch {
-            throw MicrophoneError.engineFailed(error.localizedDescription)
+        if FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.removeItem(at: url)
         }
 
         lock.lock()
-        file = audioFile
+        fileURL = url
+        file = nil
+        loggedWriteFailure = false
         lock.unlock()
 
         input.installTap(onBus: 0, bufferSize: 4_096, format: format) { [weak self] buffer, _ in
             guard let self else { return }
-            self.lock.lock()
-            let destination = self.file
-            self.lock.unlock()
-            guard let destination else { return }
-
-            do {
-                try destination.write(from: buffer)
-            } catch {
-                NSLog("Microphone write failed: \(error.localizedDescription)")
-            }
-
-            if let channel = buffer.floatChannelData?[0] {
-                let frames = Int(buffer.frameLength)
-                guard frames > 0 else { return }
-                var sum: Float = 0
-                for index in 0..<frames {
-                    let sample = channel[index]
-                    sum += sample * sample
-                }
-                let rms = sqrt(sum / Float(frames))
-                self.lock.lock()
-                self.level = min(rms * 6, 1)
-                self.lock.unlock()
-            }
+            self.write(buffer)
+            self.publishLevel(buffer)
         }
 
         do {
@@ -136,6 +113,7 @@ public final class MicrophoneRecorder: @unchecked Sendable {
             input.removeTap(onBus: 0)
             lock.lock()
             file = nil
+            fileURL = nil
             lock.unlock()
             throw MicrophoneError.engineFailed(error.localizedDescription)
         }
@@ -151,6 +129,7 @@ public final class MicrophoneRecorder: @unchecked Sendable {
             lock.unlock()
             return
         }
+        running = false
         lock.unlock()
 
         engine.inputNode.removeTap(onBus: 0)
@@ -158,8 +137,70 @@ public final class MicrophoneRecorder: @unchecked Sendable {
 
         lock.lock()
         file = nil
-        running = false
         level = 0
+        lock.unlock()
+    }
+
+    // MARK: Capture
+
+    private func write(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        var destination = file
+        let url = fileURL
+        lock.unlock()
+
+        if destination == nil, let url {
+            do {
+                // `buffer.format.settings` describes exactly what we are about to write.
+                destination = try AVAudioFile(
+                    forWriting: url,
+                    settings: buffer.format.settings,
+                    commonFormat: buffer.format.commonFormat,
+                    interleaved: buffer.format.isInterleaved
+                )
+                lock.lock()
+                file = destination
+                lock.unlock()
+            } catch {
+                lock.lock()
+                let alreadyLogged = loggedWriteFailure
+                loggedWriteFailure = true
+                lock.unlock()
+                if !alreadyLogged {
+                    NSLog("Microphone file creation failed: \(error.localizedDescription)")
+                }
+                return
+            }
+        }
+
+        guard let destination else { return }
+        do {
+            try destination.write(from: buffer)
+        } catch {
+            lock.lock()
+            let alreadyLogged = loggedWriteFailure
+            loggedWriteFailure = true
+            lock.unlock()
+            if !alreadyLogged {
+                NSLog("Microphone write failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func publishLevel(_ buffer: AVAudioPCMBuffer) {
+        guard let channel = buffer.floatChannelData?[0] else {
+            return
+        }
+        let frames = Int(buffer.frameLength)
+        guard frames > 0 else { return }
+        var sum: Float = 0
+        for index in 0..<frames {
+            let sample = channel[index]
+            sum += sample * sample
+        }
+        let rms = sqrt(sum / Float(frames))
+        lock.lock()
+        level = min(rms * 6, 1)
         lock.unlock()
     }
 }

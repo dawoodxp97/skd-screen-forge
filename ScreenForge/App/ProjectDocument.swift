@@ -41,6 +41,8 @@ public final class ProjectDocument: ObservableObject, Identifiable {
     @Published public private(set) var isTranscribing = false
     @Published public private(set) var transcriptionStatus: String?
     @Published public var errorMessage: String?
+    /// Non-blocking message shown in the editor (e.g. "nothing to suggest").
+    @Published public var notice: String?
 
     private var undoStack: [ScreenForgeProject] = []
     private var redoStack: [ScreenForgeProject] = []
@@ -103,6 +105,8 @@ public final class ProjectDocument: ObservableObject, Identifiable {
     }
 
     /// Caption lines derived from the transcript, for the inspector and timeline.
+    public var hasCursorTelemetry: Bool { !cursorSamples.isEmpty }
+
     public var captionCues: [CaptionCue] {
         guard let transcript else { return [] }
         return CaptionLayoutBuilder.cues(
@@ -221,7 +225,13 @@ public final class ProjectDocument: ObservableObject, Identifiable {
         self.selectedZoomID = nil
     }
 
-    public func runAutoZoom() {
+    @discardableResult
+    public func runAutoZoom() -> Int {
+        guard !cursorSamples.isEmpty else {
+            notice = "Magic zoom needs cursor telemetry. This recording has none — add zooms manually with ⌘-click on the timeline or the Add zoom button."
+            return 0
+        }
+
         let engine = ZoomSuggestionEngine()
         let manual = project.timeline.zooms.filter { !$0.generated }
         let suggestions = engine.suggest(
@@ -229,11 +239,19 @@ public final class ProjectDocument: ObservableObject, Identifiable {
             durationMs: project.source.durationMs,
             existingRegions: manual
         )
+
+        guard !suggestions.isEmpty else {
+            notice = "No zoom-worthy activity found. Click or dwell while recording, or add zooms manually."
+            return 0
+        }
+
         apply { project in
             let manual = project.timeline.zooms.filter { !$0.generated }
             project.timeline.zooms = (manual + suggestions).sorted { $0.startMs < $1.startMs }
             project.timeline.autoZoomEnabled = true
         }
+        notice = "Added \(suggestions.count) zoom\(suggestions.count == 1 ? "" : "s") from cursor activity."
+        return suggestions.count
     }
 
     public func clearGeneratedZooms() {

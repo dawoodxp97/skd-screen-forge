@@ -20,10 +20,14 @@ public enum CursorRecorderError: LocalizedError, Sendable {
     }
 }
 
-/// Records global mouse telemetry (position, clicks, scrolls) at up to 125 Hz.
+/// Records global mouse telemetry (position, clicks, drags) at up to 125 Hz.
 ///
-/// The screen itself is captured with the cursor hidden, so this log is the single
-/// source of truth for the post-production cursor overlay.
+/// Position and buttons are **polled** rather than only read from a `CGEventTap`.
+/// Event taps are suppressed for sandboxed apps even with Accessibility granted, which
+/// previously produced an empty `cursor.jsonl` (and therefore no cursor, no click
+/// effects, and no automatic zooms). Polling uses public, sandbox-safe CoreGraphics
+/// queries and works unconditionally; a tap is still installed when available to add
+/// scroll-wheel events.
 public final class CursorRecorder: @unchecked Sendable {
     public struct Configuration: Sendable, Equatable {
         public var displayID: CGDirectDisplayID
@@ -48,10 +52,12 @@ public final class CursorRecorder: @unchecked Sendable {
 
     private let lock = NSLock()
     private let flushQueue = DispatchQueue(label: "studio.screenforge.cursor.flush", qos: .utility)
+    private let pollQueue = DispatchQueue(label: "studio.screenforge.cursor.poll", qos: .userInteractive)
 
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var flushTimer: DispatchSourceTimer?
+    private var pollTimer: DispatchSourceTimer?
     private var fileHandle: FileHandle?
 
     private var samples: [CursorSample] = []
@@ -60,6 +66,11 @@ public final class CursorRecorder: @unchecked Sendable {
     private var displayBounds: CGRect = .zero
     private var startHostSeconds: Double = 0
     private var lastMoveMs: Int = -.max
+    private var lastClickMs: Int = -.max
+    private var lastPosition = CGPoint(x: 0.5, y: 0.5)
+    private var leftDown = false
+    private var rightDown = false
+    private var otherDown = false
     private var isRecording = false
 
     public init() {}
@@ -87,11 +98,6 @@ public final class CursorRecorder: @unchecked Sendable {
             return
         }
 
-        guard CursorRecorder.hasAccessibilityPermission() else {
-            lock.unlock()
-            throw CursorRecorderError.accessibilityDenied
-        }
-
         let bounds = configuration.normalizedBounds ?? CGDisplayBounds(configuration.displayID)
         guard bounds.width > 0, bounds.height > 0 else {
             lock.unlock()
@@ -116,51 +122,19 @@ public final class CursorRecorder: @unchecked Sendable {
         self.displayBounds = bounds
         self.startHostSeconds = CACurrentMediaTime()
         self.lastMoveMs = -.max
+        self.lastClickMs = -.max
         self.samples.removeAll(keepingCapacity: true)
         self.flushedCount = 0
         self.isRecording = true
         lock.unlock()
 
-        let mask: CGEventMask =
-            (1 << CGEventType.mouseMoved.rawValue) |
-            (1 << CGEventType.leftMouseDown.rawValue) |
-            (1 << CGEventType.leftMouseUp.rawValue) |
-            (1 << CGEventType.rightMouseDown.rawValue) |
-            (1 << CGEventType.rightMouseUp.rawValue) |
-            (1 << CGEventType.otherMouseDown.rawValue) |
-            (1 << CGEventType.otherMouseUp.rawValue) |
-            (1 << CGEventType.scrollWheel.rawValue) |
-            (1 << CGEventType.leftMouseDragged.rawValue) |
-            (1 << CGEventType.rightMouseDragged.rawValue) |
-            (1 << CGEventType.otherMouseDragged.rawValue)
-
-        guard let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .listenOnly,
-            eventsOfInterest: mask,
-            callback: cursorEventTapCallback,
-            userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else {
-            cleanup()
-            throw CursorRecorderError.eventTapUnavailable
-        }
-
-        self.tap = tap
-        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        self.runLoopSource = source
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-
         if configuration.hideSystemCursor {
             CGDisplayHideCursor(configuration.displayID)
         }
 
-        let timer = DispatchSource.makeTimerSource(queue: flushQueue)
-        timer.schedule(deadline: .now() + 1, repeating: 1)
-        timer.setEventHandler { [weak self] in self?.flush() }
-        timer.resume()
-        self.flushTimer = timer
+        startPolling(intervalMs: max(configuration.sampleIntervalMs, 4))
+        installScrollTap()
+        startFlushTimer()
     }
 
     public func stop() -> [CursorSample] {
@@ -173,17 +147,11 @@ public final class CursorRecorder: @unchecked Sendable {
         isRecording = false
         lock.unlock()
 
-        if let tap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-        }
-        if let runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        }
-        if let tap {
-            CFMachPortInvalidate(tap)
-        }
+        pollTimer?.cancel()
+        pollTimer = nil
         flushTimer?.cancel()
         flushTimer = nil
+        removeTap()
 
         if let configuration, configuration.hideSystemCursor {
             CGDisplayShowCursor(configuration.displayID)
@@ -195,9 +163,6 @@ public final class CursorRecorder: @unchecked Sendable {
         fileHandle = nil
         let result = samples
         lock.unlock()
-
-        tap = nil
-        runLoopSource = nil
         return result
     }
 
@@ -208,7 +173,150 @@ public final class CursorRecorder: @unchecked Sendable {
         return samples
     }
 
-    // MARK: Event handling
+    // MARK: Polling
+
+    private func startPolling(intervalMs: Int) {
+        let timer = DispatchSource.makeTimerSource(queue: pollQueue)
+        timer.schedule(
+            deadline: .now(),
+            repeating: .milliseconds(intervalMs),
+            leeway: .milliseconds(1)
+        )
+        timer.setEventHandler { [weak self] in self?.poll() }
+        timer.resume()
+        pollTimer = timer
+    }
+
+    private func poll() {
+        guard let event = CGEvent(source: nil) else { return }
+        let location = event.location
+        poll(location: location, left: buttonDown(.left), right: buttonDown(.right), other: buttonDown(.center))
+    }
+
+    private func buttonDown(_ button: CGMouseButton) -> Bool {
+        CGEventSource.buttonState(.combinedSessionState, button: button)
+    }
+
+    private func poll(location: CGPoint, left: Bool, right: Bool, other: Bool) {
+        lock.lock()
+        guard isRecording, let configuration else {
+            lock.unlock()
+            return
+        }
+        let bounds = displayBounds
+        let start = startHostSeconds
+        let lastMove = lastMoveMs
+        lock.unlock()
+
+        let x = (location.x - bounds.minX) / max(bounds.width, 1)
+        let y = (location.y - bounds.minY) / max(bounds.height, 1)
+        guard x >= -0.05, x <= 1.05, y >= -0.05, y <= 1.05 else { return }
+
+        let nowMs = Int((CACurrentMediaTime() - start) * 1000)
+        guard nowMs >= 0 else { return }
+
+        let normalized = CGPoint(x: min(max(x, 0), 1), y: min(max(y, 0), 1))
+        var interaction: CursorSample.Interaction?
+
+        // Button transitions are always recorded, even if the move is throttled.
+        if left && !leftDown {
+            let isDouble = nowMs - lastClickMs <= 320
+            interaction = isDouble ? .doubleClick : .click
+            lock.lock()
+            lastClickMs = nowMs
+            leftDown = true
+            lock.unlock()
+        } else if right && !rightDown {
+            interaction = .rightClick
+            lock.lock()
+            lastClickMs = nowMs
+            rightDown = true
+            lock.unlock()
+        } else if other && !otherDown {
+            interaction = .middleClick
+            lock.lock()
+            otherDown = true
+            lock.unlock()
+        } else {
+            lock.lock()
+            leftDown = left
+            rightDown = right
+            otherDown = other
+            lock.unlock()
+        }
+
+        if interaction == nil {
+            let moved = hypot(normalized.x - lastPosition.x, normalized.y - lastPosition.y) > 0.0005
+            guard moved || nowMs - lastMove >= configuration.sampleIntervalMs else { return }
+            interaction = (left || right || other) ? .drag : .move
+        }
+
+        if interaction == .move || interaction == .drag {
+            lock.lock()
+            lastMoveMs = nowMs
+            lastPosition = normalized
+            lock.unlock()
+        } else {
+            lock.lock()
+            lastPosition = normalized
+            lock.unlock()
+        }
+
+        append(CursorSample(
+            timeMs: nowMs,
+            x: normalized.x,
+            y: normalized.y,
+            interaction: interaction ?? .move,
+            visible: true
+        ))
+    }
+
+    // MARK: Scroll tap (best effort)
+
+    private func installScrollTap() {
+        let mask = CGEventMask(1) << CGEventMask(CGEventType.scrollWheel.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: mask,
+            callback: cursorEventTapCallback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            // Sandboxed apps usually cannot create taps; polling still covers moves/clicks.
+            return
+        }
+
+        self.tap = tap
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        self.runLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private func removeTap() {
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        if let runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+        }
+        if let tap {
+            CFMachPortInvalidate(tap)
+        }
+        tap = nil
+        runLoopSource = nil
+    }
+
+    private func startFlushTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: flushQueue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in self?.flush() }
+        timer.resume()
+        flushTimer = timer
+    }
+
+    // MARK: Event handling (scroll only)
 
     fileprivate func handle(type: CGEventType, event: CGEvent) {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -217,46 +325,31 @@ public final class CursorRecorder: @unchecked Sendable {
             }
             return
         }
+        guard type == .scrollWheel else { return }
 
         let location = event.location
-        let x = (location.x - displayBounds.minX) / displayBounds.width
-        let y = (location.y - displayBounds.minY) / displayBounds.height
+        let x = (location.x - displayBounds.minX) / max(displayBounds.width, 1)
+        let y = (location.y - displayBounds.minY) / max(displayBounds.height, 1)
         guard x >= -0.05, x <= 1.05, y >= -0.05, y <= 1.05 else { return }
 
-        let nowMs = Int((Double(event.timestamp) / 1_000_000_000 - startHostSeconds) * 1000)
+        let nowMs = Int((CACurrentMediaTime() - startHostSeconds) * 1000)
         guard nowMs >= 0 else { return }
 
-        let interaction: CursorSample.Interaction
-        switch type {
-        case .leftMouseDown, .leftMouseUp:
-            let clickState = event.getIntegerValueField(.mouseEventClickState)
-            interaction = clickState >= 2 && type == .leftMouseDown ? .doubleClick : (type == .leftMouseUp ? .move : .click)
-        case .rightMouseDown, .rightMouseUp:
-            interaction = type == .rightMouseDown ? .rightClick : .move
-        case .otherMouseDown, .otherMouseUp:
-            interaction = type == .otherMouseDown ? .middleClick : .move
-        case .scrollWheel:
-            interaction = .scroll
-        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            interaction = .drag
-        default:
-            interaction = .move
-        }
-
-        if interaction == .move || interaction == .drag {
-            guard nowMs - lastMoveMs >= (configuration?.sampleIntervalMs ?? 8) else { return }
-            lastMoveMs = nowMs
-        }
-
-        let sample = CursorSample(
+        append(CursorSample(
             timeMs: nowMs,
             x: min(max(x, 0), 1),
             y: min(max(y, 0), 1),
-            interaction: interaction,
+            interaction: .scroll,
             visible: true
-        )
+        ))
+    }
 
+    private func append(_ sample: CursorSample) {
         lock.lock()
+        guard isRecording else {
+            lock.unlock()
+            return
+        }
         samples.append(sample)
         lock.unlock()
     }
@@ -280,22 +373,6 @@ public final class CursorRecorder: @unchecked Sendable {
         } catch {
             NSLog("Cursor log flush failed: \(error.localizedDescription)")
         }
-    }
-
-    private func cleanup() {
-        if let tap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-        }
-        if let runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        }
-        if let tap {
-            CFMachPortInvalidate(tap)
-        }
-        tap = nil
-        runLoopSource = nil
-        fileHandle?.closeFile()
-        fileHandle = nil
     }
 }
 

@@ -245,7 +245,7 @@ public actor RecordingSession {
             let mic = MicrophoneRecorder()
             do {
                 try mic.start(
-                    url: sessionDirectory.appendingPathComponent("mic.m4a"),
+                    url: sessionDirectory.appendingPathComponent("mic.caf"),
                     enableVoiceProcessing: configuration.enableVoiceProcessing
                 )
                 microphone = mic
@@ -453,13 +453,39 @@ public enum RecordingFinalizer {
         )
 
         var microphonePath: String?
-        let micURL = mediaDirectory.appendingPathComponent("mic.m4a")
-        if FileManager.default.fileExists(atPath: micURL.path) {
-            microphonePath = try await store.importMedia(
-                from: micURL,
-                into: destination,
-                preferredName: "mic.m4a"
-            )
+        let cafURL = mediaDirectory.appendingPathComponent("mic.caf")
+        let legacyM4AURL = mediaDirectory.appendingPathComponent("mic.m4a")
+
+        if FileManager.default.fileExists(atPath: cafURL.path) {
+            // Lossless scratch track: convert to AAC for a portable, compact project.
+            let convertedURL = mediaDirectory.appendingPathComponent("mic-final.m4a")
+            do {
+                try await AudioTranscoder.toM4A(input: cafURL, output: convertedURL)
+                microphonePath = try await store.importMedia(
+                    from: convertedURL,
+                    into: destination,
+                    preferredName: "mic.m4a"
+                )
+            } catch {
+                NSLog("Microphone transcode failed: \(error.localizedDescription)")
+                microphonePath = try await store.importMedia(
+                    from: cafURL,
+                    into: destination,
+                    preferredName: "mic.caf"
+                )
+            }
+        } else if FileManager.default.fileExists(atPath: legacyM4AURL.path) {
+            // Older sessions wrote m4a directly; ignore zero-length files from the
+            // failing-write bug.
+            let asset = AVURLAsset(url: legacyM4AURL)
+            if let duration = try? await asset.load(.duration),
+               CMTimeGetSeconds(duration) > 0.05 {
+                microphonePath = try await store.importMedia(
+                    from: legacyM4AURL,
+                    into: destination,
+                    preferredName: "mic.m4a"
+                )
+            }
         }
 
         var webcamPath: String?
@@ -533,6 +559,62 @@ public enum RecordingFinalizer {
             result.append(sample)
         }
         return result
+    }
+}
+
+// MARK: - Audio transcoding
+
+public enum AudioTranscoder {
+    /// Converts a PCM capture to AAC (`m4a`) using the system encoder.
+    public static func toM4A(input: URL, output: URL) async throws {
+        let asset = AVURLAsset(url: input)
+        guard let source = try await asset.loadTracks(withMediaType: .audio).first else {
+            throw MediaComposition.CompositionError.exportFailed("No audio track to convert")
+        }
+        let range = try await source.load(.timeRange)
+        guard range.duration > .zero else {
+            throw MediaComposition.CompositionError.exportFailed("The audio track is empty")
+        }
+
+        let composition = AVMutableComposition()
+        guard let track = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            throw MediaComposition.CompositionError.exportFailed("Could not create an audio track")
+        }
+        try track.insertTimeRange(range, of: source, at: .zero)
+
+        guard let session = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetAppleM4A
+        ) else {
+            throw MediaComposition.CompositionError.exportFailed("Could not create the audio encoder")
+        }
+        if FileManager.default.fileExists(atPath: output.path) {
+            try? FileManager.default.removeItem(at: output)
+        }
+        session.outputURL = output
+        session.outputFileType = .m4a
+        session.shouldOptimizeForNetworkUse = false
+
+        nonisolated(unsafe) let exportSession = session
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            exportSession.exportAsynchronously {
+                switch exportSession.status {
+                case .completed:
+                    continuation.resume()
+                case .cancelled:
+                    continuation.resume(throwing: MediaComposition.CompositionError.exportFailed("Cancelled"))
+                default:
+                    continuation.resume(
+                        throwing: MediaComposition.CompositionError.exportFailed(
+                            exportSession.error?.localizedDescription ?? "Unknown audio error"
+                        )
+                    )
+                }
+            }
+        }
     }
 }
 

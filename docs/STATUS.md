@@ -29,7 +29,7 @@ requested only when the corresponding feature is enabled.
 | Camera capture + overlay rendering | `CameraRecorder` writes `webcam.mov`; preview uses a synced second player; export composites the camera texture |
 | Pause / resume | Segment rotation + cursor rebasing; pauses removed from output time |
 | Crash recovery | Orphaned sessions are rebuilt into projects on launch (test) |
-| Cursor-free capture, synthetic cursor | Cursor moved/smoothed by One Euro filter; themes, click ripple, idle hide, loop; drawn in preview and export |
+| Cursor-free capture, synthetic cursor | Polled telemetry (works sandboxed, no Accessibility needed), One Euro smoothing, themes, click ripple, idle hide, loop; drawn in preview and export |
 | Automatic zooms | Click/dwell/scroll clustering, overlap avoidance, magic wand (tested) |
 | Manual zooms, trims, speed regions | Output-time timeline with undo, autosave (tested) |
 | Backgrounds, padding, corner radius, shadow | Canvas inspector + compositor |
@@ -48,7 +48,7 @@ These need real hardware/permissions and were not exercised in the sandboxed tes
 
 - Screen/window capture end to end (needs a TCC grant for Screen Recording).
 - Microphone/camera capture with a physical device.
-- Accessibility cursor telemetry (needs the TCC grant).
+- Accessibility-gated extras (scroll-wheel samples); core cursor telemetry is polled and needs no grant.
 - Speech recognition against real audio.
 - Very long recordings and 4K60 sustained throughput.
 

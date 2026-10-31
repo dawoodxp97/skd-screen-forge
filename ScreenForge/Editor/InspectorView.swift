@@ -302,6 +302,14 @@ struct InspectorView: View {
                     Label("Generate zooms", systemImage: "wand.and.stars")
                 }
                 .buttonStyle(SecondaryButtonStyle())
+                .disabled(!document.hasCursorTelemetry)
+
+                if !document.hasCursorTelemetry {
+                    Text("This recording has no cursor telemetry, so there is nothing to suggest from. Add zooms manually at the playhead.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Theme.warning.opacity(0.9))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 if document.project.timeline.zooms.contains(where: \.generated) {
                     Button("Clear generated zooms") {

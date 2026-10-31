@@ -63,6 +63,7 @@ public final class AppState: ObservableObject {
     @Published public var recordsMicrophone = true
     @Published public var recordsSystemAudio = true
     @Published public var recordsCursor = true
+    @Published public var recordsCamera = false
     @Published public var captureFPS = 60
 
     @Published public var recordingPhase: RecordingPhase = .idle
@@ -73,10 +74,12 @@ public final class AppState: ObservableObject {
     @Published public var screenPermission = false
     @Published public var microphonePermission = false
     @Published public var accessibilityPermission = false
+    @Published public var cameraPermission = false
 
     // Export
     @Published public var isExporting = false
     @Published public var exportProgress: ExportProgress?
+    @Published public var isImporting = false
     @Published public var lastExportURL: URL?
     @Published public var errorMessage: String?
     @Published public var statusMessage: String?
@@ -92,6 +95,7 @@ public final class AppState: ObservableObject {
     private var elapsedTimer: Timer?
     private var exportTask: Task<Void, Never>?
     private var hudController: RecordingHUDController?
+    private var didAttemptRecovery = false
 
     public init() {
         do {
@@ -102,6 +106,23 @@ public final class AppState: ObservableObject {
         }
         refreshPermissions()
         refreshRecentProjects()
+        Task { await self.recoverOrphanedRecordingsIfNeeded() }
+    }
+
+    /// Rebuilds projects from sessions left behind by a crash or force-quit.
+    public func recoverOrphanedRecordingsIfNeeded() async {
+        guard !didAttemptRecovery, recordingPhase == .idle else { return }
+        didAttemptRecovery = true
+
+        let output = RecordingSession.defaultOutputDirectory
+        guard !RecordingRecovery.recoverableSessions(in: output).isEmpty else { return }
+
+        let recovered = await RecordingRecovery.recoverAll(in: output)
+        guard !recovered.isEmpty else { return }
+        refreshRecentProjects()
+        statusMessage = recovered.count == 1
+            ? "Recovered an interrupted recording."
+            : "Recovered \(recovered.count) interrupted recordings."
     }
 
     // MARK: - Derived
@@ -195,7 +216,14 @@ public final class AppState: ObservableObject {
                 selectedTargetID = discovered.first(where: { $0.kind == .display })?.id ?? discovered.first?.id
             }
         } catch {
-            errorMessage = "Could not list screens and windows. \(error.localizedDescription)"
+            // Without Screen Recording access the enumeration always fails; the picker
+            // already shows a permission card, so do not interrupt first launch with
+            // a modal alert.
+            targets = []
+            screenPermission = CaptureEngine.hasScreenRecordingPermission()
+            if screenPermission {
+                errorMessage = "Could not list screens and windows. \(error.localizedDescription)"
+            }
         }
     }
 
@@ -205,6 +233,7 @@ public final class AppState: ObservableObject {
         screenPermission = CaptureEngine.hasScreenRecordingPermission()
         microphonePermission = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         accessibilityPermission = CursorRecorder.hasAccessibilityPermission()
+        cameraPermission = CameraRecorder.isAuthorized
     }
 
     public func requestScreenPermission() {
@@ -218,6 +247,15 @@ public final class AppState: ObservableObject {
         microphonePermission = granted
         if !granted {
             errorMessage = "Microphone access was denied. Enable ScreenForge in System Settings → Privacy & Security → Microphone."
+        }
+    }
+
+    public func requestCameraPermission() async {
+        let granted = await CameraRecorder.requestPermission()
+        cameraPermission = granted
+        if !granted {
+            recordsCamera = false
+            statusMessage = "Camera access was denied. Enable ScreenForge in System Settings → Privacy & Security → Camera."
         }
     }
 
@@ -254,6 +292,9 @@ public final class AppState: ObservableObject {
         }
         if recordsCursor && !accessibilityPermission {
             requestAccessibilityPermission()
+        }
+        if recordsCamera && !cameraPermission {
+            await requestCameraPermission()
         }
 
         recordingPhase = .countdown
@@ -296,6 +337,8 @@ public final class AppState: ObservableObject {
                 displayName: target.title,
                 capture: capture,
                 recordsMicrophone: recordsMicrophone,
+                recordsCamera: recordsCamera && cameraPermission,
+                cameraDeviceID: nil,
                 hideSystemCursor: true,
                 recordsCursor: recordsCursor && accessibilityPermission,
                 outputDirectory: RecordingSession.defaultOutputDirectory,
@@ -419,6 +462,33 @@ public final class AppState: ObservableObject {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         Task { await openProject(url: url) }
+    }
+
+    /// Imports any video file as a new project, so the editor can be used on footage
+    /// that was not captured by ScreenForge.
+    public func importVideoPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Import a video"
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie, .gif]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await importVideo(from: url) }
+    }
+
+    public func importVideo(from url: URL) async {
+        isImporting = true
+        defer { isImporting = false }
+        do {
+            let bundle = try await ProjectImporter.createProject(
+                from: url,
+                in: RecordingSession.defaultOutputDirectory
+            )
+            await openProject(url: bundle)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     public func openProject(url: URL) async {

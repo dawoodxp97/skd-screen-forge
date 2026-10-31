@@ -242,7 +242,10 @@ struct InspectorView: View {
 
                 InspectorSlider(
                     title: "Transition",
-                    value: layoutBinding(\.transitionMs, fallback: 500),
+                    value: Binding(
+                        get: { Double(document.selectedLayout?.transitionMs ?? 500) },
+                        set: { value in updateLayout { $0.transitionMs = Int(value) } }
+                    ),
                     range: 0...2_000,
                     format: { String(format: "%.2f s", $0 / 1000) }
                 )

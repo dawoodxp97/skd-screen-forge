@@ -127,10 +127,15 @@ public final class Exporter: @unchecked Sendable {
     ) async throws -> URL {
         switch job.format {
         case .mp4:
-            return try await exportMovie(job: job, progress: progress)
+            return try await exportMovie(job: job, destination: job.outputURL, progress: progress)
+
         case .gif:
-            let movie = try await exportMovie(job: job, progress: progress)
+            // GIF runs are built from an intermediate movie, never from the .gif path.
+            let movie = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ScreenForge-\(UUID().uuidString)-gif-source.mp4")
             defer { try? FileManager.default.removeItem(at: movie) }
+
+            _ = try await exportMovie(job: job, destination: movie, progress: progress)
             progress(ExportProgress(phase: .finishing, fraction: 0.95, message: "Encoding GIF"))
             return try await GifExporter.convert(
                 movieURL: movie,
@@ -145,6 +150,7 @@ public final class Exporter: @unchecked Sendable {
 
     private func exportMovie(
         job: ExportJob,
+        destination: URL,
         progress: @escaping @Sendable (ExportProgress) -> Void
     ) async throws -> URL {
         progress(ExportProgress(phase: .preparing, fraction: 0, message: "Loading project"))
@@ -184,18 +190,28 @@ public final class Exporter: @unchecked Sendable {
             }
         }
 
+        let transcript = try? await ProjectStore.shared.loadTranscript(from: job.bundleURL)
+        let captionTrack: CaptionTrack? = {
+            guard project.captions.enabled,
+                  let transcript,
+                  !transcript.words.isEmpty else { return nil }
+            return CaptionTrack(words: transcript.words, settings: project.captions)
+        }()
+
         let renderer = FrameRenderer(
             project: project,
             bundleURL: job.bundleURL,
-            cursorSamples: try await ProjectStore.shared.loadCursor(from: job.bundleURL)
+            cursorSamples: try await ProjectStore.shared.loadCursor(from: job.bundleURL),
+            captionTrack: captionTrack
         )
 
         let tempDirectory = FileManager.default.temporaryDirectory
+        let isMP4 = destination.pathExtension.lowercased() != "mov"
+        let containerExtension = isMP4 ? "mp4" : "mov"
         let tempVideo = tempDirectory
-            .appendingPathComponent("ScreenForge-\(UUID().uuidString)-video.mov")
+            .appendingPathComponent("ScreenForge-\(UUID().uuidString)-video.\(containerExtension)")
         let tempAudio = tempDirectory
             .appendingPathComponent("ScreenForge-\(UUID().uuidString)-audio.m4a")
-        let destination = job.outputURL
 
         defer {
             try? FileManager.default.removeItem(at: tempVideo)
@@ -203,7 +219,7 @@ public final class Exporter: @unchecked Sendable {
         }
 
         // 1. Render video-only.
-        let writer = try AVAssetWriter(outputURL: tempVideo, fileType: .mov)
+        let writer = try AVAssetWriter(outputURL: tempVideo, fileType: isMP4 ? .mp4 : .mov)
         let videoSettings = Self.videoSettings(
             width: Int(canvas.width),
             height: Int(canvas.height),
@@ -363,7 +379,7 @@ public final class Exporter: @unchecked Sendable {
                 videoURL: tempVideo,
                 audioURL: tempAudio,
                 destination: destination,
-                outputFileType: destination.pathExtension.lowercased() == "mov" ? .mov : .mp4
+                outputFileType: isMP4 ? .mp4 : .mov
             )
         } else {
             try FileManager.default.moveItem(at: tempVideo, to: destination)

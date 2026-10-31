@@ -72,6 +72,7 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: ScreenForge/App/ScreenForge.entitlements
         ENABLE_APP_SANDBOX: YES
+        ENABLE_DEBUG_DYLIB: NO
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
     scheme:

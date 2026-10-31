@@ -141,6 +141,8 @@ public actor RecordingSession {
         public var displayName: String
         public var capture: CaptureConfiguration
         public var recordsMicrophone: Bool
+        public var recordsCamera: Bool
+        public var cameraDeviceID: String?
         public var hideSystemCursor: Bool
         public var recordsCursor: Bool
         public var outputDirectory: URL
@@ -150,6 +152,8 @@ public actor RecordingSession {
             displayName: String,
             capture: CaptureConfiguration,
             recordsMicrophone: Bool = true,
+            recordsCamera: Bool = false,
+            cameraDeviceID: String? = nil,
             hideSystemCursor: Bool = true,
             recordsCursor: Bool = true,
             outputDirectory: URL = RecordingSession.defaultOutputDirectory,
@@ -158,6 +162,8 @@ public actor RecordingSession {
             self.displayName = displayName
             self.capture = capture
             self.recordsMicrophone = recordsMicrophone
+            self.recordsCamera = recordsCamera
+            self.cameraDeviceID = cameraDeviceID
             self.hideSystemCursor = hideSystemCursor
             self.recordsCursor = recordsCursor
             self.outputDirectory = outputDirectory
@@ -181,6 +187,8 @@ public actor RecordingSession {
     private var capture: CaptureEngine?
     private var cursor: CursorRecorder?
     private var microphone: MicrophoneRecorder?
+    private var camera: CameraRecorder?
+    private var cameraFailure: String?
     private var startedHostSeconds: Double = 0
     private var pauseWallIntervals: [PauseInterval] = []
     private var currentPauseStartMs: Int?
@@ -191,7 +199,7 @@ public actor RecordingSession {
         let stamp = Self.timestamp()
         let safeName = Self.sanitize(configuration.displayName)
         self.sessionDirectory = configuration.outputDirectory
-            .appendingPathComponent("Recordings", isDirectory: true)
+            .appendingPathComponent("Sessions", isDirectory: true)
             .appendingPathComponent("\(stamp) \(safeName)", isDirectory: true)
         try FileManager.default.createDirectory(
             at: sessionDirectory,
@@ -248,6 +256,21 @@ public actor RecordingSession {
             }
         }
 
+        // Camera capture is best effort: a busy camera must not lose the screen take.
+        if configuration.recordsCamera, CameraRecorder.isAuthorized {
+            let recorder = CameraRecorder()
+            do {
+                try recorder.start(
+                    deviceID: configuration.cameraDeviceID,
+                    url: sessionDirectory.appendingPathComponent("webcam.mov")
+                )
+                camera = recorder
+            } catch {
+                cameraFailure = error.localizedDescription
+                NSLog("Camera capture unavailable: \(error.localizedDescription)")
+            }
+        }
+
         let engine = CaptureEngine()
         capture = engine
         do {
@@ -293,10 +316,13 @@ public actor RecordingSession {
         let captureEngine = capture
         let cursorRecorder = cursor
         let micRecorder = microphone
+        let cameraRecorder = camera
 
         await captureEngine?.stop()
         let cursorSamples = cursorRecorder?.stop() ?? []
         micRecorder?.stop()
+        // Must finish before the finalizer reads webcam.mov.
+        await cameraRecorder?.stop()
 
         if let start = currentPauseStartMs {
             pauseWallIntervals.append(PauseInterval(startMs: start, endMs: elapsedMs()))
@@ -345,9 +371,11 @@ public actor RecordingSession {
         await capture?.stop()
         _ = cursor?.stop()
         microphone?.stop()
+        await camera?.stop()
         capture = nil
         cursor = nil
         microphone = nil
+        camera = nil
         try? FileManager.default.removeItem(at: sessionDirectory)
         _state = .idle
     }
@@ -434,12 +462,22 @@ public enum RecordingFinalizer {
             )
         }
 
+        var webcamPath: String?
+        let webcamURL = mediaDirectory.appendingPathComponent("webcam.mov")
+        if FileManager.default.fileExists(atPath: webcamURL.path) {
+            webcamPath = try await store.importMedia(
+                from: webcamURL,
+                into: destination,
+                preferredName: "webcam.mov"
+            )
+        }
+
         let rebased = rebaseCursor(samples: cursorSamples, pauses: pauses)
         try await store.writeCursor(rebased, to: destination)
 
         let source = SourceInfo(
             screenPath: "\(ProjectBundleLayout.mediaDirectory)/screen.mov",
-            webcamPath: nil,
+            webcamPath: webcamPath,
             systemAudioPath: nil,
             microphonePath: microphonePath,
             durationMs: Int((durationSeconds * 1000).rounded()),
@@ -453,12 +491,17 @@ public enum RecordingFinalizer {
         let project = ScreenForgeProject(
             source: source,
             canvas: .default,
+            camera: CameraSettings(enabled: webcamPath != nil),
             timeline: .empty,
             cursor: .default,
             captions: .default,
             export: .default
         )
         try await store.save(project, to: destination)
+
+        // The finished project owns copies of everything it needs; drop the session so
+        // recording scratch space does not accumulate.
+        try? FileManager.default.removeItem(at: sessionDirectory)
 
         return RecordingResult(
             projectBundleURL: destination,
@@ -509,6 +552,11 @@ public enum MediaComposition {
     }
 
     /// Concatenates standalone `.mov` segments into one file. Returns its duration.
+    ///
+    /// Each segment was written with `startSession(atSourceTime:)` anchored to the host
+    /// clock, so its tracks start at that anchor rather than at zero. Insert the track's
+    /// own time range (not `asset.duration`, which is an absolute end time) to avoid
+    /// writing minutes of empty time per segment.
     public static func concatenate(
         segments: [RecordingSegment],
         directory: URL,
@@ -530,40 +578,53 @@ public enum MediaComposition {
             let url = directory.appendingPathComponent(segment.fileName)
             guard FileManager.default.fileExists(atPath: url.path) else { continue }
             let asset = AVURLAsset(url: url)
-            guard let duration = try? await asset.load(.duration),
-                  CMTimeCompare(duration, .zero) > 0 else { continue }
 
-            if let video = try? await asset.loadTracks(withMediaType: .video).first {
-                do {
-                    try videoTrack.insertTimeRange(
-                        CMTimeRange(start: .zero, duration: duration),
-                        of: video,
-                        at: cursor
-                    )
-                    inserted += 1
-                } catch {
-                    NSLog("Skipping segment \(segment.fileName): \(error.localizedDescription)")
-                }
+            guard let video = try? await asset.loadTracks(withMediaType: .video).first else {
+                continue
+            }
+            let videoRange = try? await video.load(.timeRange)
+            guard let videoRange, videoRange.duration > .zero else { continue }
+
+            do {
+                try videoTrack.insertTimeRange(videoRange, of: video, at: cursor)
+                inserted += 1
+            } catch {
+                NSLog("Skipping segment \(segment.fileName): \(error.localizedDescription)")
+                continue
             }
 
-            if let audio = try? await asset.loadTracks(withMediaType: .audio).first {
+            if let audio = try? await asset.loadTracks(withMediaType: .audio).first,
+               let audioRange = try? await audio.load(.timeRange),
+               audioRange.duration > .zero {
                 if audioTrack == nil {
                     audioTrack = composition.addMutableTrack(
                         withMediaType: .audio,
                         preferredTrackID: kCMPersistentTrackID_Invalid
                     )
                 }
-                try? audioTrack?.insertTimeRange(
-                    CMTimeRange(start: .zero, duration: duration),
-                    of: audio,
-                    at: cursor
+                // Keep the segment's internal audio/video offset, then clip to the video.
+                let offset = CMTimeSubtract(audioRange.start, videoRange.start)
+                let audioStart = CMTimeMaximum(.zero, CMTimeAdd(cursor, offset))
+                let available = CMTimeSubtract(
+                    CMTimeAdd(cursor, videoRange.duration),
+                    audioStart
                 )
+                let audioDuration = CMTimeMinimum(audioRange.duration, available)
+                if audioDuration > .zero {
+                    try? audioTrack?.insertTimeRange(
+                        CMTimeRange(start: audioRange.start, duration: audioDuration),
+                        of: audio,
+                        at: audioStart
+                    )
+                }
             }
 
-            cursor = CMTimeAdd(cursor, duration)
+            cursor = CMTimeAdd(cursor, videoRange.duration)
         }
 
         guard inserted > 0 else { throw CompositionError.noSegments }
+        let totalDuration = cursor
+
         guard let exporter = AVAssetExportSession(
             asset: composition,
             presetName: AVAssetExportPresetPassthrough
@@ -578,7 +639,31 @@ public enum MediaComposition {
         exporter.outputFileType = .mov
         exporter.shouldOptimizeForNetworkUse = false
 
-        nonisolated(unsafe) let session = exporter
+        do {
+            try await export(exporter)
+        } catch {
+            // Passthrough can reject segments whose encoder parameters differ; fall back
+            // to a re-encode instead of losing the recording.
+            guard let fallback = AVAssetExportSession(
+                asset: composition,
+                presetName: AVAssetExportPresetHEVCHighestQuality
+            ) else {
+                throw error
+            }
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try? FileManager.default.removeItem(at: destination)
+            }
+            fallback.outputURL = destination
+            fallback.outputFileType = .mov
+            fallback.shouldOptimizeForNetworkUse = false
+            try await export(fallback)
+        }
+
+        return CMTimeGetSeconds(totalDuration)
+    }
+
+    private static func export(_ session: AVAssetExportSession) async throws {
+        nonisolated(unsafe) let session = session
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             session.exportAsynchronously {
                 switch session.status {
@@ -595,7 +680,5 @@ public enum MediaComposition {
                 }
             }
         }
-
-        return CMTimeGetSeconds(cursor)
     }
 }

@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import ScreenForgeCore
+@testable import ScreenForge
 
 @MainActor
 @Suite("Project document")

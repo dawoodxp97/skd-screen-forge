@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import ScreenForgeCore
+@testable import ScreenForge
 
 @Suite("Timeline mapping")
 struct TimelineMapTests {

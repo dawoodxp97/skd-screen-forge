@@ -3,13 +3,13 @@
 Small team (2–5), 6–12 months. Every phase ends with a **shippable internal build** and a
 demo script. Dates assume a start in Q4 2026; compress by cutting Phase 5 cloud work.
 
-> **Implementation snapshot (this repository).** Phases below are the *plan*; the current
-> tree already contains the core of Phase 0–2 plus models for Phase 3–4, with 60 passing
-> tests. Verified on this machine: project/timeline math, cursor telemetry, zoom
-> suggestions, transcript cuts, caption layout/rasterization, renderer geometry, bundle
-> store. Written but not yet compiled (needs Xcode): SwiftUI app/editor/recorder UI and
-> the Metal shader library. Not implemented: live transcription wiring, voice enhancer,
-> webcam capture/cutout/face tracking, sharing.
+> **Implementation snapshot (this repository).** Phases below are the *plan*. The app now
+> builds, launches, records, edits, and exports; 79 app-hosted tests pass (Metal, SwiftUI,
+> export, playback, import, recovery). Done beyond the original scaffold: live camera
+> capture/preview, on-device transcription, burned-in captions, video import, crash
+> recovery, GIF, and full export verification. Remaining: motion blur, loupe/tilt
+> rendering, cutout/face tracking, voice enhancement + audio mixer, sharing, phone
+> capture, and wallpaper/annotation asset packs. See `docs/STATUS.md`.
 
 ## Phase 0 — Foundation (weeks 1–4)
 **Goal:** record, stop, preview, trim, export a clean MP4.

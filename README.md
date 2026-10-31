@@ -1,102 +1,85 @@
 # ScreenForge
 
 A native macOS screen recorder and post-production editor — a from-scratch rebuild of the
-Screen Studio 4.x feature set in **Swift 6 + SwiftUI + ScreenCaptureKit + Metal**.
+Screen Studio 4.x workflow in **Swift 6 + SwiftUI + ScreenCaptureKit + Metal**.
 
 > Working title. Not affiliated with Screen Studio. This project does not copy Screen
 > Studio's code or assets; it reimplements the documented product surface with Apple
 > frameworks and (for algorithm ideas) the MIT-licensed OpenScreen project.
 
-## Status
+**Current state:** it builds, launches, records (segmented HEVC + system audio + mic +
+optional webcam), edits on an output-time timeline, and exports MP4/GIF through the same
+Metal compositor used for preview. 79 app-hosted tests pass, including the full
+import → edit → export flow. See [`docs/STATUS.md`](docs/STATUS.md) for the feature matrix
+and the remaining parity gaps.
 
-`✅` implemented and verified on this machine · `🚧` implemented, needs a full Xcode build to verify
-· `📋` designed/modeled only · `⬜` not started
-
-| Area | Status |
-|---|---|
-| Architecture & roadmap | ✅ [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`ROADMAP.md`](ROADMAP.md) |
-| Project model, bundle codec, timeline math | ✅ 30 tests |
-| Cursor telemetry, smoothing, click model | ✅ 6 tests |
-| Auto-zoom suggestion engine | ✅ 5 tests |
-| Transcript cuts (fillers, pauses, sentences) | ✅ 9 tests |
-| Caption layout + rasterization (6 styles) | ✅ 6 tests |
-| Renderer geometry (layouts, zoom, cursor map, captions) | ✅ 10 tests |
-| Document edits (zoom, trim, annotation, undo, autosave) | ✅ 7 tests |
-| Capture engine (ScreenCaptureKit, segmented writer) | 🚧 compiles in the core build |
-| Metal compositor + shaders | 🚧 shaders need `xcrun metal` (Xcode) |
-| Exporter (Metal → AVAssetWriter, audio timeline, GIF) | 🚧 compiles in the core build |
-| Editor UI (preview, timeline, inspector, recorder) | 🚧 needs SwiftUI macros from Xcode |
-| Speech recognition (word-level, on-device) | 🚧 compiles; needs Xcode build + permission to verify |
-| Voice enhancement | 📋 Phase 2 |
-| Webcam capture, face tracking, cutout | 📋 Phase 3 (layouts/model done) |
-| Sharing | 📋 Phase 5 |
-
-### Verification status
-
-This repository was written on a machine with **only Command Line Tools** installed.
-That means:
-
-- The non-UI core (`Model`, `Analysis`, `Capture`, `Media`, document) builds and its 60 tests run
-  via SwiftPM — see below.
-- The SwiftUI layer and Metal shaders require **full Xcode** (SwiftUI's `@State` macros and
-  the `metal` compiler live only there). They are written and syntax-checked, but not yet
-  compiled. `scripts/typecheck-app.sh` exists for that step and explains what is missing.
-
-## Requirements
-
-- macOS 14.0+
-- **Swift 6.2+ Command Line Tools** — enough for `swift build` and `scripts/test.sh`
-- **Xcode 16+** — required to build the app target and compile `Shaders.metal`
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen): `brew install xcodegen`
-
-## Build & test
+## Quick start
 
 ```bash
-# Core: builds and tests with Command Line Tools only
-swift build
-./scripts/test.sh                 # 60 tests, Swift Testing
-
-# App: requires Xcode
-xcodegen generate
-xcodebuild -project ScreenForge.xcodeproj -scheme ScreenForge -destination 'platform=macOS' build
-xcodebuild test -project ScreenForge.xcodeproj -scheme ScreenForge -destination 'platform=macOS'
-
-# Type-check the SwiftUI layer without building
-./scripts/typecheck-app.sh
+brew install xcodegen           # if needed
+./scripts/run.sh                # builds build/ScreenForge.app and launches it
 ```
 
-`Package.swift` exists for the CLT workflow: it compiles the core sources as
-`ScreenForgeCore` so model math, analysis, capture, and media code can be tested without
-Xcode. The shipping app is still built from the XcodeGen project.
+Grant Screen Recording when prompted. Recordings land in
+`~/Library/Application Support/ScreenForge/Recordings` (inside the app's sandbox
+container) and open in the editor automatically when you stop.
+
+Prefer to try the editor without capturing? **File → Import Video… (⌘I)** turns any
+movie into a project.
+
+## Build, run, test
+
+```bash
+./scripts/build-app.sh    # ad-hoc signed app in build/ScreenForge.app
+./scripts/run.sh          # build + launch
+./scripts/test-xcode.sh   # 79 tests incl. Metal, SwiftUI, export, playback
+
+swift build               # core library, Command Line Tools only
+./scripts/test.sh         # core tests, no Xcode required
+```
+
+If `xcodebuild` cannot find Xcode, run `sudo xcode-select -s /Applications/Xcode.app`;
+the scripts also detect `/Applications/Xcode.app` automatically.
+
+## What is inside
+
+| Layer | Details |
+|---|---|
+| Capture | `SCStream` 60/30 fps, window or display, system audio, crash-safe 10 s segments, pause/resume, session recovery |
+| Camera | Separate `webcam.mov`, previewed with a time-synced second player, composited as PiP/split/fullscreen |
+| Cursor | `CGEventTap` telemetry, One Euro smoothing, themes, click ripples, idle hide, loop-to-start |
+| Editing | Output-time timeline (trims + speed regions), zooms with Studio easing, layouts, annotations, undo/autosave |
+| Words | On-device speech recognition, transcript cuts (fillers, pauses, sentences), six caption styles with karaoke highlight |
+| Rendering | One `FrameRenderer` → `RenderState`, consumed by both the `MTKView` preview and the exporter |
+| Export | Metal frame loop → `AVAssetWriter`; audio rebuilt on the timeline and muxed; GIF via `CGImageDestination` |
+| Projects | Portable `.sforge` bundle: `project.json`, media, `cursor.jsonl`, `transcript.json` |
 
 ## Permissions
 
-On first launch the app walks through:
-
 1. **Screen Recording** — System Settings → Privacy & Security → Screen & System Audio Recording
-2. **Microphone** — voiceover and voice enhancement
-3. **Accessibility** — global cursor telemetry (`CGEventTap`)
-4. **Camera** — optional, for the webcam layer
-5. **Speech Recognition** — optional, for on-device captions
+2. **Microphone** — voiceover
+3. **Accessibility** — global cursor telemetry
+4. **Camera** — optional webcam layer
+5. **Speech Recognition** — optional on-device captions
 
-The app is sandboxed with user-selected file access. Recordings default to
-`~/Library/Application Support/ScreenForge/Recordings`; exports go wherever the save
-panel points.
+The app is sandboxed (microphone, camera, speech, user-selected files) and ad-hoc signed
+for development.
 
 ## Repository layout
 
 ```
 ScreenForge/
-├── App/            lifecycle, menus, app state, document, permissions
-├── Capture/        SCStream capture, cursor tap, microphone, session finalizer
-├── Analysis/       zoom suggestions, transcript cuts, caption layout/track
+├── App/            lifecycle, menus, app state, project document
+├── Capture/        SCStream capture, segmented writer, cursor tap, mic, camera, recovery
+├── Analysis/       zoom suggestions, transcript cuts, caption layout, speech, import
 ├── Model/          project format, bundle store, timeline mapping, cursor telemetry
 ├── Media/          Metal compositor + shaders, frame renderer, captions, exporter, GIF
 ├── Editor/         preview (MTKView), playback engine, editor/timeline/inspector views
 ├── UI/             recorder, source picker, recording HUD, countdown, theme
-└── Resources/      asset catalog (app icon slots, accent color)
-Tests/              Swift Testing suites (timeline, zooms, cursor, captions, store, renderer)
-scripts/            test.sh, typecheck-app.sh
+└── Resources/      asset catalog
+Tests/              79 Swift Testing cases (timeline, zooms, captions, renderer, Metal, export, import, recovery, UI)
+scripts/            build-app.sh, run.sh, test-xcode.sh, test.sh, typecheck-app.sh
+docs/STATUS.md      verified features, hardware-dependent items, known gaps
 ```
 
 ## License

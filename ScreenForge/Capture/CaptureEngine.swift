@@ -326,6 +326,7 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
     private var lastPresentationTime: CMTime?
     private var segmentIndex = 0
     private var currentSegmentURL: URL?
+    private var pendingPauseStartMs: Int?
     private var manifest: RecordingManifest
     private var pendingRotations: [AVAssetWriter] = []
 
@@ -424,10 +425,8 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
             durationMs: max(0, endMs - startMs)
         ))
         if reason == .pause {
-            manifest.pauses.append(PauseInterval(
-                startMs: endMs,
-                endMs: endMs
-            ))
+            // Closed when the next segment starts; the gap between the two is the pause.
+            pendingPauseStartMs = endMs
         }
         try? writeManifest()
 
@@ -503,6 +502,14 @@ public final class SegmentedVideoWriter: @unchecked Sendable {
                 throw CaptureError.writerSetupFailed(writer.error?.localizedDescription ?? "startWriting failed")
             }
             writer.startSession(atSourceTime: pts)
+
+            if let pauseStart = pendingPauseStartMs {
+                let resumeMs = Int((CMTimeGetSeconds(pts) * 1000).rounded())
+                if resumeMs > pauseStart {
+                    manifest.pauses.append(PauseInterval(startMs: pauseStart, endMs: resumeMs))
+                    pendingPauseStartMs = nil
+                }
+            }
 
             self.writer = writer
             self.videoInput = videoInput

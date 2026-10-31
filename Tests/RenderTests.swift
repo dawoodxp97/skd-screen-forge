@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 import Testing
-@testable import ScreenForgeCore
+@testable import ScreenForge
 
 @Suite("Frame rendering")
 struct FrameRendererTests {

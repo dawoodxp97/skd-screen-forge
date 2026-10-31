@@ -11,11 +11,11 @@ let package = Package(
     name: "ScreenForge",
     platforms: [.macOS(.v14)],
     products: [
-        .library(name: "ScreenForgeCore", targets: ["ScreenForgeCore"])
+        .library(name: "ScreenForge", targets: ["ScreenForge"])
     ],
     targets: [
         .target(
-            name: "ScreenForgeCore",
+            name: "ScreenForge",
             path: "ScreenForge",
             exclude: [
                 // App shell and SwiftUI layers need Xcode (SwiftUI macros).
@@ -35,8 +35,13 @@ let package = Package(
         ),
         .testTarget(
             name: "ScreenForgeTests",
-            dependencies: ["ScreenForgeCore"],
+            dependencies: ["ScreenForge"],
             path: "Tests",
+            // App-hosted suites need SwiftUI/Metal and are only run through Xcode.
+            exclude: [
+                "AppUISmokeTests.swift",
+                "PlaybackTests.swift"
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
                 .unsafeFlags(["-strict-concurrency=complete"])

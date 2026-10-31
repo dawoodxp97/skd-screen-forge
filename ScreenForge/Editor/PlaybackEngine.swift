@@ -16,8 +16,14 @@ public final class PlaybackEngine: ObservableObject {
     @Published public var errorMessage: String?
 
     public let player = AVPlayer()
+    /// Second player that keeps the webcam asset at the same source time as the screen.
+    /// A separate player lets the compositor sample the camera as its own texture.
+    public let cameraPlayer = AVPlayer()
 
     private var videoOutput: AVPlayerItemVideoOutput?
+    private var cameraOutput: AVPlayerItemVideoOutput?
+    private var timelineMap: TimelineMap?
+    private var cameraPath: String?
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
     private var loadGeneration = 0
@@ -58,6 +64,8 @@ public final class PlaybackEngine: ObservableObject {
 
         let map = project.timeline.map(sourceDurationMs: project.source.durationMs)
         durationMs = map.outputDurationMs
+        timelineMap = map
+        cameraPath = project.source.webcamPath
         outputTimeMs = min(outputTimeMs, durationMs)
 
         do {
@@ -77,6 +85,7 @@ public final class PlaybackEngine: ObservableObject {
             videoOutput = output
 
             player.replaceCurrentItem(with: item)
+            loadCamera(project: project, bundleURL: bundleURL)
             isLoading = false
             seek(toOutputMs: 0)
         } catch {
@@ -84,6 +93,29 @@ public final class PlaybackEngine: ObservableObject {
             isLoading = false
             errorMessage = error.localizedDescription
         }
+    }
+
+    /// Attaches the camera asset when the project has one. Missing or unreadable
+    /// camera media degrades to a screen-only preview instead of failing the load.
+    private func loadCamera(project: ScreenForgeProject, bundleURL: URL) {
+        cameraPlayer.pause()
+        cameraPlayer.replaceCurrentItem(with: nil)
+        cameraOutput = nil
+
+        guard project.camera.enabled, let path = project.source.webcamPath else { return }
+        let url = bundleURL.appendingPathComponent(path)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+
+        let item = AVPlayerItem(url: url)
+        item.audioTimePitchAlgorithm = .spectral
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ])
+        item.add(output)
+        cameraOutput = output
+        cameraPlayer.replaceCurrentItem(with: item)
+        cameraPlayer.isMuted = true
+        cameraPlayer.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
     // MARK: - Transport
@@ -94,11 +126,13 @@ public final class PlaybackEngine: ObservableObject {
             seek(toOutputMs: 0)
         }
         player.play()
+        cameraPlayer.play()
         isPlaying = true
     }
 
     public func pause() {
         player.pause()
+        cameraPlayer.pause()
         isPlaying = false
     }
 
@@ -112,6 +146,14 @@ public final class PlaybackEngine: ObservableObject {
         outputTimeMs = clamped
         let time = CMTime(seconds: clamped / 1000, preferredTimescale: 600)
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        seekCamera(toOutputMs: clamped)
+    }
+
+    private func seekCamera(toOutputMs outputMs: Double) {
+        guard cameraOutput != nil, let timelineMap else { return }
+        let sourceMs = timelineMap.sourceTime(forOutputMs: outputMs) ?? 0
+        let time = CMTime(seconds: sourceMs / 1000, preferredTimescale: 600)
+        cameraPlayer.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
     public var currentSourceTimeMs: Double {
@@ -127,6 +169,16 @@ public final class PlaybackEngine: ObservableObject {
             return buffer
         }
         return videoOutput.copyPixelBuffer(forItemTime: item.currentTime(), itemTimeForDisplay: nil)
+    }
+
+    /// Newest webcam frame at the camera player's current time, if a camera is loaded.
+    public func currentCameraPixelBuffer() -> CVPixelBuffer? {
+        guard let cameraOutput, cameraPlayer.currentItem != nil else { return nil }
+        return cameraOutput.copyPixelBuffer(forItemTime: cameraPlayer.currentTime(), itemTimeForDisplay: nil)
+    }
+
+    public var hasCamera: Bool {
+        cameraOutput != nil
     }
 
     // MARK: - Internals

@@ -87,6 +87,15 @@ struct RecorderView: View {
                 .buttonStyle(SecondaryButtonStyle())
 
                 Button {
+                    app.importVideoPanel()
+                } label: {
+                    Label("Import", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(app.isImporting || app.recordingPhase != .idle)
+                .help("Import an existing video as a project (⌘I)")
+
+                Button {
                     app.revealProjectsFolder()
                 } label: {
                     Image(systemName: "externaldrive")
@@ -233,6 +242,13 @@ struct CaptureOptionsView: View {
                     detail: app.accessibilityPermission ? "Synthetic cursor, clicks, smoothing" : "Accessibility permission required",
                     isOn: $app.recordsCursor
                 )
+                Divider().overlay(Theme.stroke)
+                OptionRow(
+                    icon: "video.fill",
+                    title: "Camera",
+                    detail: app.cameraPermission ? "Webcam overlay and camera layouts" : "Permission required",
+                    isOn: $app.recordsCamera
+                )
             }
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -360,6 +376,17 @@ struct PermissionsView: View {
                     granted: app.accessibilityPermission || !app.recordsCursor
                 ) {
                     app.requestAccessibilityPermission()
+                }
+
+                Divider().overlay(Theme.stroke)
+
+                PermissionRow(
+                    icon: "video.fill",
+                    title: "Camera",
+                    detail: "Used when the camera layer is enabled",
+                    granted: app.cameraPermission || !app.recordsCamera
+                ) {
+                    Task { await app.requestCameraPermission() }
                 }
             }
             .background(

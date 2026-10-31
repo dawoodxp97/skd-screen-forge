@@ -155,6 +155,12 @@ struct ScreenForgeCommands: Commands {
             }
             .keyboardShortcut("o", modifiers: .command)
 
+            Button("Import Video…") {
+                app.importVideoPanel()
+            }
+            .keyboardShortcut("i", modifiers: .command)
+            .disabled(app.isImporting || app.recordingPhase != .idle)
+
             Divider()
 
             Button("Show Editor") {

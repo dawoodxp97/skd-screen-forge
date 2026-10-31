@@ -51,6 +51,8 @@ public struct PreviewView: NSViewRepresentable {
         private let compositor: Compositor?
         private var lastFrame: MetalFrameTexture?
         private var lastBuffer: CVPixelBuffer?
+        private var lastCameraFrame: MetalFrameTexture?
+        private var lastCameraBuffer: CVPixelBuffer?
         private weak var mtkView: MTKView?
 
         init(document: ProjectDocument, playback: PlaybackEngine) {
@@ -85,6 +87,13 @@ public struct PreviewView: NSViewRepresentable {
                     }
                 }
 
+                if let buffer = playback.currentCameraPixelBuffer() {
+                    lastCameraBuffer = buffer
+                    if let frame = compositor.texture(from: buffer) {
+                        lastCameraFrame = frame
+                    }
+                }
+
                 let state = document.renderer.state(
                     atOutputMs: playback.outputTimeMs,
                     canvasSize: view.drawableSize
@@ -93,7 +102,7 @@ public struct PreviewView: NSViewRepresentable {
                 compositor.encode(
                     state: state,
                     screen: lastFrame?.texture,
-                    camera: nil,
+                    camera: lastCameraFrame?.texture,
                     in: pass,
                     commandBuffer: commandBuffer
                 )

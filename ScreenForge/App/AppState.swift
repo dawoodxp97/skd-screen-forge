@@ -65,10 +65,16 @@ public final class AppState: ObservableObject {
     @Published public var recordsCursor = true
     @Published public var recordsCamera = false
     @Published public var captureFPS = 60
+    @Published public var externalAudioDeviceID: String?
+    @Published public var availableAudioDevices: [CaptureDeviceInfo] = []
+    @Published public var availableVideoDevices: [CaptureDeviceInfo] = []
+    @Published public var deviceCaptureActive = false
+    @Published public var deviceCaptureName = ""
 
     @Published public var recordingPhase: RecordingPhase = .idle
     @Published public var countdownValue: Int?
     @Published public var elapsedMs: Int = 0
+    @Published public var recordingMarkerCount: Int = 0
 
     // Permissions
     @Published public var screenPermission = false
@@ -81,6 +87,8 @@ public final class AppState: ObservableObject {
     @Published public var exportProgress: ExportProgress?
     @Published public var isImporting = false
     @Published public var lastExportURL: URL?
+    @Published public var lastUpdate: UpdateInfo?
+    @Published public var showLicensePanel = false
     @Published public var errorMessage: String?
     @Published public var statusMessage: String?
 
@@ -89,6 +97,9 @@ public final class AppState: ObservableObject {
     public let compositor: Compositor?
 
     private var session: RecordingSession?
+    private var deviceRecorder: DeviceCaptureRecorder?
+    private var deviceTempURL: URL?
+    private var deviceKind: DeviceMockupKind = .none
     private var startedAt: Date?
     private var pausedAt: Date?
     private var pausedTotal: TimeInterval = 0
@@ -338,11 +349,13 @@ public final class AppState: ObservableObject {
                 hideSystemCursor: true,
                 recordsCursor: recordsCursor,
                 outputDirectory: RecordingSession.defaultOutputDirectory,
-                enableVoiceProcessing: true
+                enableVoiceProcessing: true,
+                externalAudioDeviceID: externalAudioDeviceID
             ))
             try await recordingSession.start()
             session = recordingSession
             recordingPhase = .recording
+            recordingMarkerCount = 0
             startedAt = Date()
             pausedAt = nil
             pausedTotal = 0
@@ -358,8 +371,16 @@ public final class AppState: ObservableObject {
         }
     }
 
-    public func pauseOrResume() async {
+    /// Drops a marker at the current recording time. Markers survive finalization and
+    /// show up on the editor's marker lane.
+    public func addRecordingMarker(kind: TimelineMarkerKind = .marker) async {
         guard let session else { return }
+        guard await session.addMarker(kind: kind) != nil else { return }
+        recordingMarkerCount = await session.markerCount
+        statusMessage = kind == .flag ? "Flagged" : "Marker added"
+    }
+
+    public func pauseOrResume() async {        guard let session else { return }
         switch recordingPhase {
         case .recording:
             await session.pause()
@@ -387,6 +408,7 @@ public final class AppState: ObservableObject {
             let result = try await session.stop()
             self.session = nil
             recordingPhase = .idle
+            recordingMarkerCount = 0
             await openProject(url: result.projectBundleURL)
             refreshRecentProjects()
         } catch {
@@ -405,6 +427,115 @@ public final class AppState: ObservableObject {
         self.session = nil
         recordingPhase = .idle
         elapsedMs = 0
+        recordingMarkerCount = 0
+    }
+
+    // MARK: - Device capture & audio devices
+
+    public func refreshCaptureDevices() {
+        availableAudioDevices = CaptureDeviceCatalog.audioDevices()
+        availableVideoDevices = CaptureDeviceCatalog.videoDevices()
+    }
+
+    /// Records the screen of a connected iPhone/iPad (or external video device).
+    public func startDeviceCapture(device: CaptureDeviceInfo) async {
+        guard !deviceCaptureActive, recordingPhase == .idle else { return }
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForge-device-\(UUID().uuidString).mov")
+        let recorder = DeviceCaptureRecorder(url: temp, deviceID: device.id)
+        do {
+            try recorder.start()
+            deviceRecorder = recorder
+            deviceTempURL = temp
+            deviceKind = device.mockupKind
+            deviceCaptureName = device.name
+            deviceCaptureActive = true
+            statusMessage = "Capturing \(device.name)"
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func stopDeviceCapture() async {
+        guard let recorder = deviceRecorder, let temp = deviceTempURL else { return }
+        deviceCaptureActive = false
+        do {
+            let movie = try await recorder.stop()
+            deviceRecorder = nil
+            deviceTempURL = nil
+            let bundle = try await makeDeviceProject(
+                movie: movie,
+                name: deviceCaptureName.isEmpty ? "Device capture" : deviceCaptureName,
+                kind: deviceKind
+            )
+            try? FileManager.default.removeItem(at: temp)
+            await openProject(url: bundle)
+            refreshRecentProjects()
+        } catch {
+            deviceRecorder = nil
+            deviceTempURL = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func cancelDeviceCapture() {
+        deviceRecorder?.cancel()
+        deviceRecorder = nil
+        deviceCaptureActive = false
+        if let temp = deviceTempURL {
+            try? FileManager.default.removeItem(at: temp)
+        }
+        deviceTempURL = nil
+    }
+
+    private func makeDeviceProject(
+        movie: URL,
+        name: String,
+        kind: DeviceMockupKind
+    ) async throws -> URL {
+        let destination = RecordingSession.defaultOutputDirectory
+            .appendingPathComponent(
+                "\(RecordingSession.sanitize(name)) \(RecordingSession.timestamp()).\(ProjectBundleLayout.fileExtension)",
+                isDirectory: true
+            )
+        let store = ProjectStore.shared
+        try await store.createBundle(at: destination)
+        let storedPath = try await store.importMedia(
+            from: movie,
+            into: destination,
+            preferredName: "device.mov"
+        )
+
+        let asset = AVURLAsset(url: movie)
+        let duration = try await asset.load(.duration)
+        let durationMs = max(Int((CMTimeGetSeconds(duration) * 1000).rounded()), 0)
+        let track = try await asset.loadTracks(withMediaType: .video).first
+        let size = try await track?.load(.naturalSize) ?? CGSize(width: 1_080, height: 1_920)
+
+        let project = ScreenForgeProject(
+            source: SourceInfo(
+                screenPath: storedPath,
+                durationMs: durationMs,
+                pixelWidth: Int(size.width.rounded()),
+                pixelHeight: Int(size.height.rounded()),
+                displayName: name,
+                cursorCaptureMode: .bakedIn
+            ),
+            canvas: CanvasSettings(
+                aspect: size.height >= size.width ? .vertical : .wide,
+                padding: 0.08,
+                cornerRadius: 0.03,
+                deviceMockup: DeviceMockup(kind: kind == .none ? .iPhone : kind)
+            ),
+            camera: .default,
+            timeline: .empty,
+            cursor: CursorSettings(visible: false),
+            captions: .default,
+            export: ExportSettings(resolution: .p1080, fps: 60, codec: .h264, quality: 0.85)
+        )
+        try await store.save(project, to: destination)
+        return destination
     }
 
     public func discardCountdown() {
@@ -557,9 +688,22 @@ public final class AppState: ObservableObject {
 
         let panel = NSSavePanel()
         panel.title = "Export \(format.label)"
-        panel.nameFieldStringValue = "\(document.project.source.displayName).\(format.fileExtension)"
+        let extensionForFormat: String = {
+            switch format {
+            case .gif: "gif"
+            case .mp4: document.project.export.fileExtension
+            }
+        }()
+        panel.nameFieldStringValue = "\(document.project.source.displayName).\(extensionForFormat)"
         panel.canCreateDirectories = true
-        panel.allowedContentTypes = format == .gif ? [.gif] : [.mpeg4Movie]
+        switch format {
+        case .gif:
+            panel.allowedContentTypes = [.gif]
+        case .mp4:
+            panel.allowedContentTypes = document.project.export.codec.isProRes
+                ? [.quickTimeMovie]
+                : [.mpeg4Movie]
+        }
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         isExporting = true
@@ -593,5 +737,61 @@ public final class AppState: ObservableObject {
         exportTask?.cancel()
         exportTask = nil
         isExporting = false
+    }
+
+    /// Applies a delivery preset to the open project so the next export matches the
+    /// chosen recipe (resolution, frame rate, codec, quality).
+    public func applyExportPreset(_ preset: ExportPreset) {
+        guard let document else { return }
+        document.apply { project in
+            project.export = preset.settings
+        }
+        statusMessage = "\(preset.name) ready to export"
+    }
+
+    // MARK: - Sharing / updates
+
+    public func shareLastExport() {
+        guard let url = lastExportURL else {
+            statusMessage = "Export a video first, then share it."
+            return
+        }
+        SharingService.presentShareSheet(for: url)
+    }
+
+    public func shareLastExportViaAirDrop() {
+        guard let url = lastExportURL else {
+            statusMessage = "Export a video first, then share it."
+            return
+        }
+        SharingService.shareViaAirDrop(url)
+    }
+
+    public func createShareLink() async {
+        guard let url = lastExportURL else {
+            statusMessage = "Export a video first, then share it."
+            return
+        }
+        do {
+            let link = try await SharingService.upload(url)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(link.absoluteString, forType: .string)
+            statusMessage = "Link copied: \(link.absoluteString)"
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    public func checkForUpdates() async {
+        guard UpdateChecker.feedURL != nil else {
+            statusMessage = "Update checks are not configured. Set SCREENFORGE_UPDATE_FEED to an appcast JSON URL."
+            return
+        }
+        if let update = await UpdateChecker.check() {
+            lastUpdate = update
+            statusMessage = "Version \(update.version) is available."
+        } else {
+            statusMessage = "ScreenForge \(UpdateChecker.currentVersion) is up to date."
+        }
     }
 }

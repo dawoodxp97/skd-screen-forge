@@ -69,14 +69,15 @@ public final class PlaybackEngine: ObservableObject {
         outputTimeMs = min(outputTimeMs, durationMs)
 
         do {
-            let composition = try await PreviewCompositionBuilder.makeComposition(
+            let preview = try await PreviewCompositionBuilder.makePreview(
                 project: project,
                 bundleURL: bundleURL
             )
             guard generation == loadGeneration else { return }
 
-            let item = AVPlayerItem(asset: composition)
+            let item = AVPlayerItem(asset: preview.composition)
             item.audioTimePitchAlgorithm = .spectral
+            item.audioMix = preview.audioMix
 
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA

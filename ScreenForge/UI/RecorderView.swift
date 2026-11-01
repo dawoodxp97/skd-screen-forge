@@ -19,6 +19,7 @@ struct RecorderView: View {
                         hero
                         SourcePickerView()
                         CaptureOptionsView()
+                        DeviceCaptureView()
                     }
                     .frame(maxWidth: .infinity, alignment: .top)
 
@@ -38,6 +39,7 @@ struct RecorderView: View {
         .background(Theme.backgroundGradient.ignoresSafeArea())
         .task {
             app.refreshPermissions()
+            app.refreshCaptureDevices()
             if app.targets.isEmpty {
                 await app.refreshTargets()
             }
@@ -274,6 +276,32 @@ struct CaptureOptionsView: View {
                     .fill(Theme.backgroundRaised)
             )
 
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("External audio")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.textPrimary)
+                    Text("Record an interface or mixer as its own bus")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                }
+                Spacer()
+                Picker("External audio", selection: $app.externalAudioDeviceID) {
+                    Text("None").tag(String?.none)
+                    ForEach(app.availableAudioDevices) { device in
+                        Text(device.name).tag(String?.some(device.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(maxWidth: 200)
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Theme.backgroundRaised)
+            )
+
             if app.recordsCursor && !app.accessibilityPermission {
                 Button {
                     app.requestAccessibilityPermission()
@@ -322,6 +350,78 @@ private struct OptionRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 11)
+    }
+}
+
+// MARK: - Device capture
+
+struct DeviceCaptureView: View {
+    @EnvironmentObject private var app: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("iPhone / iPad capture").sectionLabel()
+                Spacer()
+                Button {
+                    app.refreshCaptureDevices()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            if app.deviceCaptureActive {
+                HStack(spacing: 10) {
+                    Circle().fill(Theme.danger).frame(width: 8, height: 8)
+                    Text("Recording \(app.deviceCaptureName)")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.textPrimary)
+                    Spacer()
+                    Button("Stop") {
+                        Task { await app.stopDeviceCapture() }
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    Button("Cancel") {
+                        app.cancelDeviceCapture()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Theme.danger)
+                }
+            } else if app.availableVideoDevices.isEmpty {
+                Text("Connect an iPhone or iPad with a cable, trust this Mac, and refresh. Recording starts a project with a matching device frame.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(app.availableVideoDevices) { device in
+                    HStack(spacing: 10) {
+                        Image(systemName: device.kind == .iPhone ? "iphone" : (device.kind == .iPad ? "ipad" : "display"))
+                            .foregroundStyle(Theme.accent)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(device.name)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(Theme.textPrimary)
+                                .lineLimit(1)
+                            Text(device.kind.rawValue)
+                                .font(.system(size: 9))
+                                .foregroundStyle(Theme.textTertiary)
+                        }
+                        Spacer()
+                        Button("Capture") {
+                            Task { await app.startDeviceCapture(device: device) }
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(app.recordingPhase != .idle)
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+        .panel()
     }
 }
 

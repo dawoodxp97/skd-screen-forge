@@ -11,7 +11,7 @@ public final class RecordingHUDController {
     public func show(appState: AppState) {
         guard panel == nil else { return }
 
-        let size = NSSize(width: 440, height: 84)
+        let size = NSSize(width: 540, height: 84)
         let panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -82,13 +82,45 @@ struct RecordingHUDView: View {
                 Text(isPaused ? "Paused" : "Recording")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.85))
-                Text(app.elapsedLabel)
-                    .font(.system(size: 20, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                    .foregroundStyle(.white)
+                HStack(spacing: 6) {
+                    Text(app.elapsedLabel)
+                        .font(.system(size: 20, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                    if app.recordingMarkerCount > 0 {
+                        Label("\(app.recordingMarkerCount)", systemImage: "bookmark.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.yellow.opacity(0.9))
+                            .labelStyle(.titleAndIcon)
+                    }
+                }
             }
 
             Spacer(minLength: 8)
+
+            Button {
+                Task { await app.addRecordingMarker() }
+            } label: {
+                Image(systemName: "bookmark.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .background(.white.opacity(0.12), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.yellow)
+            .help("Add a marker at this moment (⌘M)")
+
+            Button {
+                Task { await app.addRecordingMarker(kind: .flag) }
+            } label: {
+                Image(systemName: "flag.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 34, height: 34)
+                    .background(.white.opacity(0.12), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.orange)
+            .help("Flag this moment for review")
 
             Button {
                 Task { await app.pauseOrResume() }

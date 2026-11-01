@@ -9,9 +9,9 @@ Screen Studio 4.x workflow in **Swift 6 + SwiftUI + ScreenCaptureKit + Metal**.
 
 **Current state:** it builds, launches, records (segmented HEVC + system audio + mic +
 optional webcam), edits on an output-time timeline, and exports MP4/GIF through the same
-Metal compositor used for preview. 79 app-hosted tests pass, including the full
+Metal compositor used for preview. 134 app-hosted tests pass, including the full
 import → edit → export flow. See [`docs/STATUS.md`](docs/STATUS.md) for the feature matrix
-and the remaining parity gaps.
+and [`docs/SCREEN_STUDIO_PARITY.md`](docs/SCREEN_STUDIO_PARITY.md) for the evidence-based comparison and the remaining gaps.
 
 ## Quick start
 
@@ -33,7 +33,7 @@ movie into a project.
 ./scripts/build-app.sh    # ad-hoc signed app in build/ScreenForge.app
 ./scripts/run.sh          # build + launch
 ./scripts/run.sh --logs   # build + launch, logging to build/screenforge.log
-./scripts/test-xcode.sh   # 79 tests incl. Metal, SwiftUI, export, playback
+./scripts/test-xcode.sh   # 134 tests incl. Metal, SwiftUI, export, playback
 
 swift build               # core library, Command Line Tools only
 ./scripts/test.sh         # core tests, no Xcode required
@@ -49,14 +49,21 @@ the scripts also detect `/Applications/Xcode.app` automatically.
 
 | Layer | Details |
 |---|---|
-| Capture | `SCStream` 60/30 fps, window or display, system audio, crash-safe 10 s segments, pause/resume, session recovery |
+| Capture | `SCStream` 60/30 fps, window or display, system audio, external audio input, microphone, crash-safe 10 s segments, pause/resume, session recovery |
+| Device capture | iPhone/iPad/external video devices recorded through AVFoundation with a matching vector device frame |
+| Looks | Person-matte cutout, motion blur, 3D tilt, `.cube` LUTs, analytic grades, grain, sharpen, super-resolution, MacBook/iPhone/iPad mockups |
+| Privacy | Vision OCR + face detection produce editable blurred masks; person mattes are stored per sample |
 | Camera | Separate `webcam.mov`, previewed with a time-synced second player, composited as PiP/split/fullscreen |
 | Cursor | `CGEventTap` telemetry, One Euro smoothing, themes, click ripples, idle hide, loop-to-start |
-| Editing | Output-time timeline (trims + speed regions), zooms with Studio easing, layouts, annotations, undo/autosave |
+| Audio | Mic/system buses, music and sound-effect clips, voiceover recording, fades, music ducking, silence VAD |
+| Markers | Live markers/flags during recording, timeline lane, chapter promotion, crash-safe |
+| Editing | Output-time timeline (trims + speed regions), classic + loupe zooms, layouts, markers, annotations, undo/autosave |
 | Words | On-device speech recognition, transcript cuts (fillers, pauses, sentences), six caption styles with karaoke highlight |
 | Rendering | One `FrameRenderer` → `RenderState`, consumed by both the `MTKView` preview and the exporter |
-| Export | Metal frame loop → `AVAssetWriter`; audio rebuilt on the timeline and muxed; GIF via `CGImageDestination` |
-| Projects | Portable `.sforge` bundle: `project.json`, media, `cursor.jsonl`, `transcript.json` |
+| Export | Metal frame loop → `AVAssetWriter`; H.264/HEVC/ProRes; mixed and enhanced audio rebuilt on the timeline; eight presets; chapter metadata; GIF via `CGImageDestination` |
+| Sharing | System share sheet, AirDrop, optional upload endpoint; offline Ed25519 licensing and JSON appcast update checks |
+| Library | 27 generated wallpapers, four click-sound packs, saved project presets, 3D LUT library |
+| Projects | Portable `.sforge` bundle: `project.json`, media, masks, `cursor.jsonl`, `transcript.json` |
 
 ## Permissions
 

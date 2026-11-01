@@ -298,3 +298,68 @@ system ─► CoreAudio tap ──────► (optional music duck) ─┘
 | Speech accuracy / languages | On-device Speech first, whisper.cpp fallback; language picker; editable transcript. |
 | Cloud scope creep | Ship local-first v1; share links behind a feature flag; projects are files first. |
 | 6–12 month solo/small-team schedule | Phase gates in ROADMAP.md; each phase ends with a shippable build. |
+
+---
+
+## 15. Implementation addendum (current shipped code)
+
+The sections above describe the target architecture. This addendum records how the
+shipped code currently satisfies it, so the document does not overstate progress.
+Evidence levels and the Screen Studio comparison live in
+[`docs/SCREEN_STUDIO_PARITY.md`](docs/SCREEN_STUDIO_PARITY.md).
+
+- **Project schema v2** (`Model/Project.swift`): additive `audio` (`AudioMixSettings`) and
+  `analysis` (`ProjectAnalysis`: silence ranges + face samples) plus timeline `markers`
+  and `audioClips`. Decoders default missing keys, so v1 projects open unchanged.
+  Markers/clips live on **output** time and are clamped by
+  `ScreenForgeProject.normalized()` once the output duration is known.
+- **Render pipeline:** `FrameRenderer.state(atOutputMs:)` resolves layout, zoom, cursor,
+  camera opacity/reframe, annotations, and captions. Zoom carries a `kind`; the
+  compositor draws a real loupe lens (`drawLoupe`) for `.loupe` and the classic
+  scale-around-focus otherwise. Camera opacity fades over 180 ms at silence edges and
+  follows `FaceSample` centers when face tracking is on.
+- **Audio:** capture writes a lossless mic scratch file, finalized to AAC. Export builds
+  one composition track per source (system or screen track, mic, and every music /
+  sound-effect / voiceover clip) with `AVMutableAudioMixInputParameters` for gain, fade
+  ramps, and music ducking around voiceover intervals. Clips use output time, so they
+  survive trims and speed changes.
+- **Recording markers:** the HUD (and ⌘M / ⇧⌘M) appends to the session manifest and a
+  crash-safe `markers.json`. `RecordingFinalizer.rebaseMarkers` drops markers inside
+  pauses and shifts later ones; recovery reads the same file.
+- **Export:** H.264/HEVC at 10/24/30/50/60 fps and ProRes 422 LT/422/422 HQ/4444 in a
+  `.mov` container. GIF export always renders an H.264 720p intermediate. The eight
+  built-in presets are `ExportPreset.builtIn`.
+- **Analyzers:** `SilenceDetector` (RMS windows, padded/merged ranges) and
+  `FaceDetector` (Vision rectangles, triangular smoothing) run offline and store results
+  in the project.
+
+
+## 16. Advanced parity addendum
+
+- **Person matte:** `PersonMatteDetector` samples the webcam with
+  `VNGeneratePersonSegmentationRequest`, writes grayscale PNGs, and stores
+  `PersonMaskFrame`s in `project.analysis`. `Compositor` draws the camera through a
+  dedicated `cutout_fragment` that feathers the matte; fallback is the masked camera.
+- **Motion blur / tilt:** zoom focus and scale are sampled 34 ms apart to derive a blur
+  direction and amount. The vertex stage composes a perspective rotation around the
+  screen quad for the stored 3D presets. Both are pure functions of the render state,
+  so preview and export match.
+- **Color:** `ColorGrade` selects an analytic look (Golden, Mono, Terra, Teal & Orange,
+  Cool, Warm, Noir) or a user `.cube` uploaded as a 3D texture. The fragment stage also
+  applies grain and an unsharp mask. Super-resolution uses a Catmull-Rom sampler when
+  the layer is magnified.
+- **Audio:** `VoiceEnhancer` runs an offline HPF → gate → presence EQ → compressor →
+  limiter chain, cached in `~/Library/Caches/ScreenForge/Voice` keyed by file identity and
+  settings. `TimelineAudioMixer` adds the enhanced mic, system, external-device, music,
+  SFX, and voiceover tracks with gain/fade/ducking ramps.
+- **Device capture:** `DeviceCaptureCatalog` lists AVFoundation audio/video devices
+  (including connected iPhones/iPads); `ExternalAudioRecorder` records an audio bus and
+  `DeviceCaptureRecorder` records a device movie, which becomes a project with a vector
+  mockup.
+- **Privacy:** `SensitiveDataScanner` runs OCR and face detection, merges detections
+  across samples, and creates generated blur annotations; the compositor samples the
+  frame region under each mask through the backdrop shader.
+- **Delivery:** `ChapterWriter` edits `moov/udta/chpl` after export. `ProjectPresetStore`
+  persists style presets. `SharingService` wraps the system share sheet / AirDrop and an
+  optional multipart upload endpoint; `UpdateChecker` and `LicenseManager` implement the
+  local sides of the account service.

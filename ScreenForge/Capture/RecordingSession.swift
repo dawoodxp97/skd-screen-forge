@@ -51,6 +51,9 @@ public struct RecordingManifest: Codable, Sendable, Equatable {
     public var pauses: [PauseInterval]
     public var state: State
     public var completedAt: Date?
+    /// Live markers captured from the HUD. Optional so manifests written by older
+    /// builds keep decoding.
+    public var markers: [TimelineMarker]?
 
     public init(
         sessionID: UUID,
@@ -64,7 +67,8 @@ public struct RecordingManifest: Codable, Sendable, Equatable {
         segments: [RecordingSegment] = [],
         pauses: [PauseInterval] = [],
         state: State = .recording,
-        completedAt: Date? = nil
+        completedAt: Date? = nil,
+        markers: [TimelineMarker]? = nil
     ) {
         self.version = 1
         self.sessionID = sessionID
@@ -79,6 +83,7 @@ public struct RecordingManifest: Codable, Sendable, Equatable {
         self.pauses = pauses
         self.state = state
         self.completedAt = completedAt
+        self.markers = markers
     }
 
     public var durationMs: Int {
@@ -147,6 +152,8 @@ public actor RecordingSession {
         public var recordsCursor: Bool
         public var outputDirectory: URL
         public var enableVoiceProcessing: Bool
+        /// Unique ID of an audio input recorded as the external-device bus.
+        public var externalAudioDeviceID: String?
 
         public init(
             displayName: String,
@@ -157,7 +164,8 @@ public actor RecordingSession {
             hideSystemCursor: Bool = true,
             recordsCursor: Bool = true,
             outputDirectory: URL = RecordingSession.defaultOutputDirectory,
-            enableVoiceProcessing: Bool = true
+            enableVoiceProcessing: Bool = true,
+            externalAudioDeviceID: String? = nil
         ) {
             self.displayName = displayName
             self.capture = capture
@@ -168,6 +176,7 @@ public actor RecordingSession {
             self.recordsCursor = recordsCursor
             self.outputDirectory = outputDirectory
             self.enableVoiceProcessing = enableVoiceProcessing
+            self.externalAudioDeviceID = externalAudioDeviceID
         }
     }
 
@@ -187,11 +196,13 @@ public actor RecordingSession {
     private var capture: CaptureEngine?
     private var cursor: CursorRecorder?
     private var microphone: MicrophoneRecorder?
+    private var externalAudio: ExternalAudioRecorder?
     private var camera: CameraRecorder?
     private var cameraFailure: String?
     private var startedHostSeconds: Double = 0
     private var pauseWallIntervals: [PauseInterval] = []
     private var currentPauseStartMs: Int?
+    private var markers: [TimelineMarker] = []
     private var _state: RecordingState = .idle
 
     public init(configuration: Configuration) throws {
@@ -208,6 +219,22 @@ public actor RecordingSession {
     }
 
     public var state: RecordingState { _state }
+
+    public var markerCount: Int { markers.count }
+
+    /// Adds a marker at the current recording time. Markers recorded during a pause
+    /// are discarded by the finalizer along with the paused media.
+    @discardableResult
+    public func addMarker(
+        label: String = "Marker",
+        kind: TimelineMarkerKind = .marker
+    ) -> TimelineMarker? {
+        guard _state == .recording || _state == .paused else { return nil }
+        let marker = TimelineMarker(timeMs: elapsedMs(), label: label, kind: kind)
+        markers.append(marker)
+        saveMarkers()
+        return marker
+    }
 
     // MARK: Lifecycle
 
@@ -253,6 +280,19 @@ public actor RecordingSession {
                 _ = cursor?.stop()
                 cursor = nil
                 throw error
+            }
+        }
+
+        if let externalDeviceID = configuration.externalAudioDeviceID {
+            let recorder = ExternalAudioRecorder(
+                url: sessionDirectory.appendingPathComponent("external.m4a"),
+                deviceID: externalDeviceID
+            )
+            do {
+                try recorder.start()
+                externalAudio = recorder
+            } catch {
+                NSLog("External audio unavailable: \(error.localizedDescription)")
             }
         }
 
@@ -316,11 +356,13 @@ public actor RecordingSession {
         let captureEngine = capture
         let cursorRecorder = cursor
         let micRecorder = microphone
+        let externalRecorder = externalAudio
         let cameraRecorder = camera
 
         await captureEngine?.stop()
         let cursorSamples = cursorRecorder?.stop() ?? []
         micRecorder?.stop()
+        externalRecorder?.stop()
         // Must finish before the finalizer reads webcam.mov.
         await cameraRecorder?.stop()
 
@@ -344,10 +386,15 @@ public actor RecordingSession {
             )
         }
 
-        guard let manifest else {
+        guard var manifest else {
             _state = .failed("Missing recording manifest")
             throw RecordingError.noVideoSegments
         }
+        if markers.isEmpty, let data = try? Data(contentsOf: sessionDirectory.appendingPathComponent("markers.json")),
+           let saved = try? JSONDecoder().decode([TimelineMarker].self, from: data) {
+            markers = saved
+        }
+        manifest.markers = markers
 
         do {
             let result = try await RecordingFinalizer.makeProject(
@@ -355,6 +402,7 @@ public actor RecordingSession {
                 manifest: manifest,
                 cursorSamples: cursorSamples,
                 pauses: pauseWallIntervals,
+                markers: markers,
                 outputDirectory: configuration.outputDirectory,
                 projectName: configuration.displayName
             )
@@ -372,9 +420,11 @@ public actor RecordingSession {
         _ = cursor?.stop()
         microphone?.stop()
         await camera?.stop()
+        externalAudio?.stop()
         capture = nil
         cursor = nil
         microphone = nil
+        externalAudio = nil
         camera = nil
         try? FileManager.default.removeItem(at: sessionDirectory)
         _state = .idle
@@ -393,6 +443,8 @@ public actor RecordingSession {
         cursor = nil
         microphone?.stop()
         microphone = nil
+        externalAudio?.stop()
+        externalAudio = nil
     }
 
     private func loadManifest() -> RecordingManifest? {
@@ -401,6 +453,12 @@ public actor RecordingSession {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(RecordingManifest.self, from: data)
+    }
+
+    private func saveMarkers() {
+        let url = sessionDirectory.appendingPathComponent("markers.json")
+        guard let data = try? JSONEncoder().encode(markers) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 
     // MARK: Naming
@@ -429,6 +487,7 @@ public enum RecordingFinalizer {
         manifest: RecordingManifest,
         cursorSamples: [CursorSample],
         pauses: [PauseInterval],
+        markers: [TimelineMarker] = [],
         outputDirectory: URL,
         projectName: String
     ) async throws -> RecordingResult {
@@ -488,6 +547,20 @@ public enum RecordingFinalizer {
             }
         }
 
+        var externalAudioPath: String?
+        let externalURL = mediaDirectory.appendingPathComponent("external.m4a")
+        if FileManager.default.fileExists(atPath: externalURL.path) {
+            let asset = AVURLAsset(url: externalURL)
+            if let duration = try? await asset.load(.duration),
+               CMTimeGetSeconds(duration) > 0.05 {
+                externalAudioPath = try await store.importMedia(
+                    from: externalURL,
+                    into: destination,
+                    preferredName: "external.m4a"
+                )
+            }
+        }
+
         var webcamPath: String?
         let webcamURL = mediaDirectory.appendingPathComponent("webcam.mov")
         if FileManager.default.fileExists(atPath: webcamURL.path) {
@@ -501,11 +574,15 @@ public enum RecordingFinalizer {
         let rebased = rebaseCursor(samples: cursorSamples, pauses: pauses)
         try await store.writeCursor(rebased, to: destination)
 
+        let allMarkers = markers.isEmpty ? (manifest.markers ?? []) : markers
+        let rebasedMarkers = rebaseMarkers(allMarkers, pauses: pauses)
+
         let source = SourceInfo(
             screenPath: "\(ProjectBundleLayout.mediaDirectory)/screen.mov",
             webcamPath: webcamPath,
             systemAudioPath: nil,
             microphonePath: microphonePath,
+            externalAudioPath: externalAudioPath,
             durationMs: Int((durationSeconds * 1000).rounded()),
             pixelWidth: manifest.pixelWidth,
             pixelHeight: manifest.pixelHeight,
@@ -518,7 +595,7 @@ public enum RecordingFinalizer {
             source: source,
             canvas: .default,
             camera: CameraSettings(enabled: webcamPath != nil),
-            timeline: .empty,
+            timeline: Timeline(markers: rebasedMarkers),
             cursor: .default,
             captions: .default,
             export: .default
@@ -534,6 +611,33 @@ public enum RecordingFinalizer {
             manifest: manifest,
             durationMs: source.durationMs
         )
+    }
+
+    /// Drops markers recorded during pauses and shifts later markers left.
+    static func rebaseMarkers(
+        _ markers: [TimelineMarker],
+        pauses: [PauseInterval]
+    ) -> [TimelineMarker] {
+        guard !pauses.isEmpty else { return markers.sorted { $0.timeMs < $1.timeMs } }
+        let sorted = pauses.sorted { $0.startMs < $1.startMs }
+        var result: [TimelineMarker] = []
+
+        for var marker in markers {
+            var shift = 0
+            var insidePause = false
+            for pause in sorted {
+                if marker.timeMs >= pause.endMs {
+                    shift += pause.durationMs
+                } else if marker.timeMs >= pause.startMs {
+                    insidePause = true
+                    break
+                }
+            }
+            guard !insidePause else { continue }
+            marker.timeMs = max(0, marker.timeMs - shift)
+            result.append(marker)
+        }
+        return result.sorted { $0.timeMs < $1.timeMs }
     }
 
     /// Drops samples recorded during pauses and shifts later samples left.

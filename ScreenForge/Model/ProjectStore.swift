@@ -218,8 +218,9 @@ public actor ProjectStore {
             project.source.screenPath,
             project.source.webcamPath,
             project.source.systemAudioPath,
-            project.source.microphonePath
-        ].compactMap { $0 }
+            project.source.microphonePath,
+            project.source.externalAudioPath
+        ].compactMap { $0 } + project.timeline.audioClips.map(\.path)
         for path in required where !fileManager.fileExists(
             atPath: mediaURL(for: path, in: bundleURL).path
         ) {

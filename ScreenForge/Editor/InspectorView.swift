@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Right-hand inspector for the open project. Continuous controls write through
 /// `ProjectDocument.apply`, so every change is normalized, autosaved, and undoable.
@@ -9,12 +10,16 @@ struct InspectorView: View {
     @EnvironmentObject private var app: AppState
 
     @State private var tab: Tab = .zoom
+    @State private var wallpaperCategory = "macOS"
+    @State private var presetName = ""
+    @State private var sensitivePhrases = ""
 
     enum Tab: String, CaseIterable, Identifiable {
         case zoom
         case style
         case cursor
         case camera
+        case audio
         case captions
         case export
 
@@ -26,6 +31,7 @@ struct InspectorView: View {
             case .style: "paintbrush.pointed"
             case .cursor: "cursorarrow"
             case .camera: "person.crop.square"
+            case .audio: "waveform"
             case .captions: "captions.bubble"
             case .export: "square.and.arrow.up"
             }
@@ -37,6 +43,7 @@ struct InspectorView: View {
             case .style: "Style"
             case .cursor: "Cursor"
             case .camera: "Camera"
+            case .audio: "Audio"
             case .captions: "Captions"
             case .export: "Export"
             }
@@ -96,12 +103,139 @@ struct InspectorView: View {
 
     @ViewBuilder
     private var selectionEditors: some View {
-        if document.selectedAnnotation != nil {
+        if document.selectedAudioClip != nil {
+            audioClipEditor
+        } else if document.selectedMarker != nil {
+            markerEditor
+        } else if document.selectedAnnotation != nil {
             annotationEditor
         } else if document.selectedSpeed != nil {
             speedEditor
         } else if document.selectedLayout != nil {
             layoutEditor
+        }
+    }
+
+    private var markerEditor: some View {
+        InspectorSection("Selected marker") {
+            if let marker = document.selectedMarker {
+                TextField("Label", text: markerBinding(\.label, fallback: "Marker"))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .padding(9)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Theme.background)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Theme.stroke, lineWidth: 1)
+                    }
+
+                Picker("Kind", selection: markerBinding(\.kind, fallback: .marker)) {
+                    ForEach(TimelineMarkerKind.allCases, id: \.self) { kind in
+                        Label(kind.label, systemImage: kind.symbol).tag(kind)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                Text("At \(timeLabel(marker.timeMs)) · output time")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.textTertiary)
+
+                Button("Move to playhead") {
+                    document.apply { project in
+                        guard let index = project.timeline.markers.firstIndex(where: { $0.id == marker.id }) else { return }
+                        project.timeline.markers[index].timeMs = Int(playback.outputTimeMs)
+                    }
+                }
+                .buttonStyle(SecondaryButtonStyle())
+
+                Button(role: .destructive) {
+                    document.deleteSelectedMarker()
+                } label: {
+                    Label("Delete marker", systemImage: "trash")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.danger)
+            }
+        }
+    }
+
+    private var audioClipEditor: some View {
+        InspectorSection("Selected audio") {
+            if let clip = document.selectedAudioClip {
+                Text(clip.kind.label)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.textTertiary)
+
+                TextField("Label", text: audioBinding(\.label, fallback: clip.kind.label))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .padding(9)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Theme.background)
+                    )
+
+                InspectorSlider(
+                    title: "Volume",
+                    value: audioBinding(\.volume, fallback: 1),
+                    range: 0...2,
+                    format: { String(format: "%.0f%%", $0 * 100) }
+                )
+                InspectorSlider(
+                    title: "Fade in",
+                    value: Binding(
+                        get: { Double(document.selectedAudioClip?.fadeInMs ?? 0) },
+                        set: { value in updateAudioClip { $0.fadeInMs = Int(value) } }
+                    ),
+                    range: 0...5_000,
+                    format: { String(format: "%.2f s", $0 / 1000) }
+                )
+                InspectorSlider(
+                    title: "Fade out",
+                    value: Binding(
+                        get: { Double(document.selectedAudioClip?.fadeOutMs ?? 0) },
+                        set: { value in updateAudioClip { $0.fadeOutMs = Int(value) } }
+                    ),
+                    range: 0...5_000,
+                    format: { String(format: "%.2f s", $0 / 1000) }
+                )
+
+                HStack(spacing: 8) {
+                    Button("Start here") {
+                        let start = Int(min(max(playback.outputTimeMs, 0), document.outputDurationMs))
+                        updateAudioClip { $0.startMs = start }
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    Button(clip.loops ? "Looping" : "Loop") {
+                        updateAudioClip { $0.loops.toggle() }
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                }
+
+                InspectorToggle(
+                    title: "Mute clip",
+                    detail: "Keep it on the timeline but silent",
+                    isOn: audioBinding(\.muted, fallback: false)
+                )
+
+                Text("\(timeLabel(clip.startMs)) → \(timeLabel(clip.endMs))")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.textTertiary)
+
+                Button(role: .destructive) {
+                    document.deleteSelectedAudioClip()
+                } label: {
+                    Label("Delete clip", systemImage: "trash")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.danger)
+            }
         }
     }
 
@@ -283,6 +417,7 @@ struct InspectorView: View {
         case .style: styleTab
         case .cursor: cursorTab
         case .camera: cameraTab
+        case .audio: audioTab
         case .captions: captionsTab
         case .export: exportTab
         }
@@ -353,6 +488,25 @@ struct InspectorView: View {
                         Picker("Easing", selection: zoomBinding(\.easing, fallback: .screenStudio)) {
                             ForEach(ZoomEasing.allCases, id: \.self) { easing in
                                 Text(easing.label).tag(easing)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .frame(maxWidth: 130)
+                    }
+
+                    HStack {
+                        Text("3D tilt")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.textSecondary)
+                        Spacer()
+                        Picker("3D tilt", selection: Binding(
+                            get: { document.selectedZoom?.rotation },
+                            set: { value in updateZoom { $0.rotation = value } }
+                        )) {
+                            Text("None").tag(Rotation3DPreset?.none)
+                            ForEach(Rotation3DPreset.allCases, id: \.self) { preset in
+                                Text(preset.label).tag(Rotation3DPreset?.some(preset))
                             }
                         }
                         .pickerStyle(.menu)
@@ -464,6 +618,198 @@ struct InspectorView: View {
                             }
                         }
                     }
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        importBackgroundPanel()
+                    } label: {
+                        Label("Image", systemImage: "photo")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+
+                    Button {
+                        useCurrentWallpaper()
+                    } label: {
+                        Label("Wallpaper", systemImage: "desktopcomputer")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                }
+
+                if document.project.canvas.background.kind == .solid ||
+                    document.project.canvas.background.kind == .gradient {
+                    ColorField(
+                        title: document.project.canvas.background.kind == .solid ? "Fill" : "Top",
+                        hex: colorBinding(index: 0)
+                    )
+                    if document.project.canvas.background.kind == .gradient {
+                        ColorField(title: "Bottom", hex: colorBinding(index: 1))
+                    }
+                }
+
+                if document.project.canvas.background.kind == .image,
+                   let path = document.project.canvas.background.imagePath {
+                    Text(path)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            InspectorSection("Wallpaper pack") {
+                Picker("Category", selection: $wallpaperCategory) {
+                    ForEach(WallpaperLibrary.categories, id: \.self) { category in
+                        Text(category).tag(category)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 8),
+                        GridItem(.flexible(), spacing: 8),
+                        GridItem(.flexible(), spacing: 8)
+                    ],
+                    spacing: 8
+                ) {
+                    ForEach(WallpaperLibrary.presets(in: wallpaperCategory)) { preset in
+                        Button {
+                            Task { await document.applyWallpaper(preset) }
+                        } label: {
+                            VStack(spacing: 5) {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(
+                                        LinearGradient(
+                                            colors: preset.colors.map { Color(hexString: $0) },
+                                            startPoint: .topLeading,
+                                            endPoint: .bottomTrailing
+                                        )
+                                    )
+                                    .frame(height: 34)
+                                    .overlay {
+                                        if document.project.canvas.background.identifier == preset.id {
+                                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                .strokeBorder(Theme.accent, lineWidth: 2)
+                                        }
+                                    }
+                                Text(preset.name)
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundStyle(Theme.textTertiary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(preset.name)
+                    }
+                }
+            }
+
+            InspectorSection("Motion & image") {
+                InspectorSlider(
+                    title: "Motion blur",
+                    value: binding(\.canvas.motionBlur),
+                    range: 0...1,
+                    format: percent
+                )
+                InspectorToggle(
+                    title: "Super resolution",
+                    detail: "Edge-directed upscale when magnified",
+                    isOn: binding(\.canvas.superResolution)
+                )
+            }
+
+            InspectorSection("Color grading") {
+                HStack {
+                    Text("Look")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Picker("Look", selection: binding(\.canvas.grade.preset)) {
+                        ForEach(ColorGradePreset.allCases, id: \.self) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(maxWidth: 150)
+                }
+                InspectorSlider(
+                    title: "Intensity",
+                    value: binding(\.canvas.grade.intensity),
+                    range: 0...1,
+                    format: percent
+                )
+                InspectorSlider(
+                    title: "Grain",
+                    value: binding(\.canvas.grade.grain),
+                    range: 0...1,
+                    format: percent
+                )
+                InspectorSlider(
+                    title: "Sharpen",
+                    value: binding(\.canvas.grade.sharpen),
+                    range: 0...1,
+                    format: percent
+                )
+                HStack(spacing: 8) {
+                    Button {
+                        importLUTPanel()
+                    } label: {
+                        Label("Import .cube", systemImage: "cube.transparent")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    if document.project.canvas.grade.lutPath != nil {
+                        Button("Clear LUT") { document.clearLUT() }
+                            .buttonStyle(SecondaryButtonStyle())
+                    }
+                }
+                if let path = document.project.canvas.grade.lutPath {
+                    Text((path as NSString).lastPathComponent)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Theme.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+
+            InspectorSection("Device mockup") {
+                HStack {
+                    Text("Frame")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Picker("Frame", selection: binding(\.canvas.deviceMockup.kind)) {
+                        ForEach(DeviceMockupKind.allCases, id: \.self) { kind in
+                            Text(kind.label).tag(kind)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(maxWidth: 150)
+                }
+                Menu {
+                    ForEach(DeviceMockupPreset.all) { preset in
+                        Button(preset.name) {
+                            document.apply { $0.canvas.deviceMockup = preset.mockup }
+                        }
+                    }
+                } label: {
+                    Label(
+                        document.project.canvas.deviceMockup.model ?? "Choose a model",
+                        systemImage: "square.grid.2x2"
+                    )
+                    .font(.system(size: 11, weight: .medium))
+                }
+                .menuStyle(.borderlessButton)
+                if document.project.canvas.deviceMockup.kind != .none {
+                    InspectorSlider(
+                        title: "Bezel",
+                        value: binding(\.canvas.deviceMockup.bezel),
+                        range: 0.01...0.14,
+                        format: percent
+                    )
+                    ColorField(title: "Body", hex: binding(\.canvas.deviceMockup.colorHex))
                 }
             }
 
@@ -635,6 +981,46 @@ struct InspectorView: View {
                     range: 0...1,
                     format: percent
                 )
+                InspectorSlider(
+                    title: "Sharpen",
+                    value: binding(\.camera.sharpen),
+                    range: 0...1,
+                    format: percent
+                )
+
+                HStack {
+                    Text("Grade")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Picker("Grade", selection: binding(\.camera.grade.preset)) {
+                        ForEach(ColorGradePreset.allCases, id: \.self) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(maxWidth: 150)
+                }
+            }
+
+            InspectorSection("Person cutout") {
+                InspectorToggle(
+                    title: "Cut out the speaker",
+                    detail: "Matte the camera so only the person is drawn",
+                    isOn: binding(\.camera.cutout)
+                )
+                Text("\(document.project.analysis.personMasks.count) matte frames stored")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.textTertiary)
+                Button {
+                    Task { await document.generatePersonMatte() }
+                } label: {
+                    Label("Build person matte", systemImage: "person.crop.rectangle")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(document.isAnalyzing)
+                .help("Runs Apple's on-device person segmentation over the camera track")
             }
 
             InspectorSection("Behavior") {
@@ -658,6 +1044,314 @@ struct InspectorView: View {
                     detail: "Fade the camera out when nobody speaks",
                     isOn: binding(\.camera.hideDuringSilence)
                 )
+            }
+        }
+    }
+
+    private var audioTab: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            InspectorSection("Mixer") {
+                InspectorSlider(
+                    title: "Microphone",
+                    value: binding(\.audio.microphoneVolume),
+                    range: 0...2,
+                    format: percent
+                )
+                InspectorSlider(
+                    title: "System audio",
+                    value: binding(\.audio.systemVolume),
+                    range: 0...2,
+                    format: percent
+                )
+                InspectorSlider(
+                    title: "External device",
+                    value: binding(\.audio.externalVolume),
+                    range: 0...2,
+                    format: percent
+                )
+                InspectorSlider(
+                    title: "Music",
+                    value: binding(\.audio.musicVolume),
+                    range: 0...2,
+                    format: percent
+                )
+                InspectorSlider(
+                    title: "Voiceover",
+                    value: binding(\.audio.voiceoverVolume),
+                    range: 0...2,
+                    format: percent
+                )
+                InspectorSlider(
+                    title: "Sound effects",
+                    value: binding(\.audio.soundEffectVolume),
+                    range: 0...2,
+                    format: percent
+                )
+            }
+
+            InspectorSection("Ducking") {
+                InspectorToggle(
+                    title: "Duck music under voice",
+                    detail: "Lower music while a voiceover plays",
+                    isOn: binding(\.audio.duckMusicUnderVoice)
+                )
+                InspectorSlider(
+                    title: "Duck amount",
+                    value: binding(\.audio.duckAmount),
+                    range: 0...1,
+                    format: percent
+                )
+            }
+
+            InspectorSection("Voice cleanup") {
+                HStack {
+                    Text("Enhancement")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Picker("Enhancement", selection: binding(\.audio.voiceEnhancement)) {
+                        ForEach(VoiceEnhancementMode.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(maxWidth: 150)
+                }
+                InspectorSlider(
+                    title: "Noise reduction",
+                    value: binding(\.audio.noiseReduction),
+                    range: 0...1,
+                    format: percent
+                )
+                Text("High-pass · gate · presence EQ · compressor · limiter, rendered offline and cached. Preview and export share the same chain.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            InspectorSection("Click sounds") {
+                HStack {
+                    Text("Pack")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textSecondary)
+                    Spacer()
+                    Picker("Pack", selection: Binding(
+                        get: { document.project.cursor.clickSound ?? "" },
+                        set: { value in
+                            document.apply {
+                                $0.cursor.clickSound = value.isEmpty ? nil : value
+                            }
+                        }
+                    )) {
+                        Text("None").tag("")
+                        ForEach(ClickSoundLibrary.packs) { pack in
+                            Text(pack.name).tag(pack.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(maxWidth: 170)
+                }
+                InspectorSlider(
+                    title: "Volume",
+                    value: binding(\.audio.clickSoundVolume),
+                    range: 0...1,
+                    format: percent
+                )
+                Button {
+                    Task {
+                        await document.addClickSounds(
+                            packID: document.project.cursor.clickSound
+                                ?? ClickSoundLibrary.packs[0].id
+                        )
+                    }
+                } label: {
+                    Label("Render click track", systemImage: "cursorarrow.click.2")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(!document.hasCursorTelemetry)
+            }
+
+            InspectorSection("Voiceover") {
+                if document.isRecordingVoiceover {
+                    HStack(spacing: 8) {
+                        Circle().fill(Color.red).frame(width: 8, height: 8)
+                        Text("Recording voiceover…")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Theme.textPrimary)
+                    }
+                    Button("Stop and place") {
+                        Task { await document.stopVoiceover() }
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    Button("Discard") { document.cancelVoiceover() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Theme.danger)
+                } else {
+                    Text("Record narration from the playhead and place it on the audio lane.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        Task { await document.startVoiceover(atOutputMs: playback.outputTimeMs) }
+                    } label: {
+                        Label("Record voiceover", systemImage: "mic.fill")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                }
+            }
+
+            InspectorSection("Clips") {
+                HStack(spacing: 8) {
+                    Button {
+                        importAudioPanel(kind: .music)
+                    } label: {
+                        Label("Music", systemImage: "music.note")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+
+                    Button {
+                        importAudioPanel(kind: .soundEffect)
+                    } label: {
+                        Label("Sound", systemImage: "sparkles")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                }
+
+                if document.project.timeline.audioClips.isEmpty {
+                    Text("No audio clips yet. Music and sound effects are mixed with the recorded tracks at export.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(document.project.timeline.audioClips) { clip in
+                        HStack(spacing: 7) {
+                            Image(systemName: clip.kind.symbol)
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.accent)
+                            Text(clip.label)
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.textPrimary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(timeLabel(clip.startMs))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(Theme.textTertiary)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            document.selectedAudioClipID = clip.id
+                            document.selectedMarkerID = nil
+                            document.selectedAnnotationID = nil
+                            document.selectedZoomID = nil
+                        }
+                    }
+                }
+            }
+
+            InspectorSection("Analysis") {
+                Text("Silence ranges fade the camera out automatically; face samples keep the speaker centered.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("\(document.project.analysis.silenceRanges.count) silent ranges · \(document.project.analysis.faceSamples.count) face samples")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.textSecondary)
+
+                Button {
+                    Task { await document.detectSilence() }
+                } label: {
+                    Label("Detect silence", systemImage: "waveform.badge.mic")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(document.isAnalyzing)
+
+                Button {
+                    Task { await document.analyzeFaces() }
+                } label: {
+                    Label("Analyze faces", systemImage: "person.crop.rectangle")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(document.isAnalyzing)
+
+                if let status = document.analysisStatus {
+                    Text(status)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                }
+            }
+
+            InspectorSection("Privacy scan") {
+                Text("Detects faces and private text (emails, keys, numbers) and adds editable masks. Expands by 8 pt like Screen Studio.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                TextField("Custom phrases, comma separated", text: $sensitivePhrases)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .padding(8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Theme.background)
+                    )
+                Button {
+                    let phrases = sensitivePhrases
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    Task {
+                        await document.scanForSensitiveData(customPhrases: phrases)
+                    }
+                } label: {
+                    Label("Scan for sensitive data", systemImage: "eye.slash")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(document.isScanningSensitiveData)
+
+                if document.project.timeline.annotations.contains(where: { $0.generated == true }) {
+                    Button("Remove auto masks") { document.clearGeneratedMasks() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Theme.danger)
+                }
+            }
+
+            InspectorSection("Markers") {
+                if document.project.timeline.markers.isEmpty {
+                    Text("Markers recorded live appear here. Add one at the playhead with ⌘M.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(document.project.timeline.markers) { marker in
+                        HStack(spacing: 7) {
+                            Image(systemName: marker.kind.symbol)
+                                .font(.system(size: 9))
+                                .foregroundStyle(Color(hexString: marker.colorHex))
+                            Text(marker.label)
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.textPrimary)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(timeLabel(marker.timeMs))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(Theme.textTertiary)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            document.selectedMarkerID = marker.id
+                            document.selectedAudioClipID = nil
+                        }
+                    }
+
+                    Button("Promote to chapters") {
+                        document.promoteMarkersToChapters()
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                }
             }
         }
     }
@@ -817,6 +1511,79 @@ struct InspectorView: View {
 
     private var exportTab: some View {
         VStack(alignment: .leading, spacing: 14) {
+            InspectorSection("Presets") {
+                Menu {
+                    ForEach(ExportPreset.builtIn) { preset in
+                        Button {
+                            app.applyExportPreset(preset)
+                        } label: {
+                            Text("\(preset.name) — \(preset.detail)")
+                        }
+                    }
+                } label: {
+                    Label("Apply a preset", systemImage: "square.stack.3d.up")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .menuStyle(.borderlessButton)
+
+                ForEach(ExportPreset.builtIn.filter { $0.matches(document.project.export) }) { preset in
+                    Text(preset.name)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+            }
+
+            InspectorSection("Project presets") {
+                HStack(spacing: 8) {
+                    TextField("Preset name", text: $presetName)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11))
+                        .padding(7)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(Theme.background)
+                        )
+                    Button {
+                        Task {
+                            await document.savePreset(named: presetName)
+                            presetName = ""
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(presetName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .help("Save the current look as a preset")
+                }
+
+                if document.presets.isEmpty {
+                    Text("Presets store canvas, camera, cursor, captions, audio mix, and export settings.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(document.presets) { preset in
+                        HStack(spacing: 8) {
+                            Button(preset.name) {
+                                document.applyPreset(preset)
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Theme.textPrimary)
+                            Spacer()
+                            Button {
+                                Task { await document.deletePreset(preset) }
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.system(size: 9))
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Theme.textTertiary)
+                        }
+                    }
+                }
+            }
+
             InspectorSection("Video") {
                 Picker("Resolution", selection: binding(\.export.resolution)) {
                     ForEach(ExportResolution.allCases, id: \.self) { resolution in
@@ -855,13 +1622,15 @@ struct InspectorView: View {
                         .foregroundStyle(Theme.textSecondary)
                     Spacer()
                     Picker("Frame rate", selection: binding(\.export.fps)) {
+                        Text("10").tag(10)
                         Text("24").tag(24)
                         Text("30").tag(30)
+                        Text("50").tag(50)
                         Text("60").tag(60)
                     }
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                     .labelsHidden()
-                    .frame(width: 140)
+                    .frame(width: 90)
                 }
 
                 HStack {
@@ -874,10 +1643,14 @@ struct InspectorView: View {
                             Text(codec.label).tag(codec)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                     .labelsHidden()
-                    .frame(width: 140)
+                    .frame(width: 150)
                 }
+
+                Text("Delivers .\(document.project.export.fileExtension.uppercased())")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(Theme.textTertiary)
 
                 InspectorSlider(
                     title: "Quality",
@@ -931,6 +1704,23 @@ struct InspectorView: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(SecondaryButtonStyle())
+
+                    HStack(spacing: 8) {
+                        Button {
+                            app.shareLastExport()
+                        } label: {
+                            Label("Share", systemImage: "square.and.arrow.up.on.square")
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+
+                        Button {
+                            Task { await app.createShareLink() }
+                        } label: {
+                            Label("Copy link", systemImage: "link")
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                    }
+                    .disabled(app.lastExportURL == nil)
                 }
 
                 Button {
@@ -1001,6 +1791,114 @@ struct InspectorView: View {
             get: { document.selectedAnnotation?.text ?? "" },
             set: { value in updateAnnotation { $0.text = value } }
         )
+    }
+
+    private func markerBinding<T>(
+        _ keyPath: WritableKeyPath<TimelineMarker, T>,
+        fallback: T
+    ) -> Binding<T> {
+        Binding(
+            get: { document.selectedMarker?[keyPath: keyPath] ?? fallback },
+            set: { value in
+                guard let id = document.selectedMarkerID else { return }
+                document.apply { project in
+                    guard let index = project.timeline.markers.firstIndex(where: { $0.id == id }) else { return }
+                    project.timeline.markers[index][keyPath: keyPath] = value
+                }
+            }
+        )
+    }
+
+    private func audioBinding<T>(
+        _ keyPath: WritableKeyPath<AudioClip, T>,
+        fallback: T
+    ) -> Binding<T> {
+        Binding(
+            get: { document.selectedAudioClip?[keyPath: keyPath] ?? fallback },
+            set: { value in updateAudioClip { $0[keyPath: keyPath] = value } }
+        )
+    }
+
+    private func updateAudioClip(_ mutation: @escaping (inout AudioClip) -> Void) {
+        guard let id = document.selectedAudioClipID else { return }
+        document.apply { project in
+            guard let index = project.timeline.audioClips.firstIndex(where: { $0.id == id }) else { return }
+            mutation(&project.timeline.audioClips[index])
+        }
+    }
+
+    private func colorBinding(index: Int) -> Binding<String> {
+        Binding(
+            get: {
+                let colors = document.project.canvas.background.colors
+                return colors.indices.contains(index) ? colors[index] : "#000000"
+            },
+            set: { value in
+                document.apply { project in
+                    var colors = project.canvas.background.colors
+                    while colors.count <= index { colors.append("#000000") }
+                    colors[index] = value
+                    project.canvas.background.colors = colors
+                }
+            }
+        )
+    }
+
+    private func importBackgroundPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a background image"
+        panel.allowedContentTypes = [.image]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await document.importBackgroundImage(from: url) }
+    }
+
+    private func useCurrentWallpaper() {
+        guard let screen = NSScreen.main,
+              let url = NSWorkspace.shared.desktopImageURL(for: screen) else {
+            document.notice = "macOS did not report a desktop picture for this display."
+            return
+        }
+        Task {
+            await document.importBackgroundImage(from: url)
+            document.apply { $0.canvas.background.identifier = "current-wallpaper" }
+        }
+    }
+
+    private func importLUTPanel() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a 3D LUT (.cube)"
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "cube") ?? .data
+        ]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await document.importLUT(from: url) }
+    }
+
+    private func importAudioPanel(kind: AudioClipKind) {        let panel = NSOpenPanel()
+        panel.title = kind == .music ? "Import music" : "Import a sound effect"
+        panel.allowedContentTypes = [.audio, .mp3, .mpeg4Audio, .wav, .aiff]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            await document.importAudio(
+                from: url,
+                kind: kind,
+                atOutputMs: playback.outputTimeMs
+            )
+        }
+    }
+
+    private func timeLabel(_ milliseconds: Int) -> String {
+        let seconds = max(milliseconds, 0) / 1000
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 
     private func updateZoom(_ mutation: @escaping (inout ZoomRegion) -> Void) {
@@ -1178,8 +2076,43 @@ private struct InspectorToggle: View {
     }
 }
 
-private struct BackgroundSwatch: View {
-    let preset: InspectorView.BackgroundPreset
+/// A hex color row: macOS color well plus the literal hex value for copy/paste.
+private struct ColorField: View {
+    let title: String
+    @Binding var hex: String
+
+    private var color: Binding<Color> {
+        Binding(
+            get: { Color(hexString: hex) },
+            set: { newValue in
+                let converted = NSColor(newValue).usingColorSpace(.sRGB) ?? .black
+                hex = String(
+                    format: "#%02X%02X%02X",
+                    Int((converted.redComponent * 255).rounded()),
+                    Int((converted.greenComponent * 255).rounded()),
+                    Int((converted.blueComponent * 255).rounded())
+                )
+            }
+        )
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.textSecondary)
+            Spacer()
+            Text(hex.uppercased())
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Theme.textTertiary)
+            ColorPicker("", selection: color, supportsOpacity: false)
+                .labelsHidden()
+                .frame(width: 44)
+        }
+    }
+}
+
+private struct BackgroundSwatch: View {    let preset: InspectorView.BackgroundPreset
     let selected: Bool
     let action: () -> Void
 

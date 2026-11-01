@@ -7,10 +7,29 @@ import Foundation
 /// Video and every audio source are cut on the same timeline map (trims + speed),
 /// so scrubbing and playback match the exporter exactly.
 public enum PreviewCompositionBuilder {
+    /// The playable composition plus the mix that applies clip gains, fades, and
+    /// ducking. `AVPlayerItem.audioMix` consumes the parameters.
+    public struct Preview: @unchecked Sendable {
+        public var composition: AVMutableComposition
+        public var audioMix: AVMutableAudioMix?
+
+        public init(composition: AVMutableComposition, audioMix: AVMutableAudioMix?) {
+            self.composition = composition
+            self.audioMix = audioMix
+        }
+    }
+
     public static func makeComposition(
         project: ScreenForgeProject,
         bundleURL: URL
     ) async throws -> AVMutableComposition {
+        try await makePreview(project: project, bundleURL: bundleURL).composition
+    }
+
+    public static func makePreview(
+        project: ScreenForgeProject,
+        bundleURL: URL
+    ) async throws -> Preview {
         let normalized = project.normalized()
         let map = normalized.timeline.map(sourceDurationMs: normalized.source.durationMs)
         guard map.outputDurationMs > 100 else {
@@ -62,62 +81,19 @@ public enum PreviewCompositionBuilder {
             throw ExportError.noVideoTrack
         }
 
-        var audioAssets: [AVURLAsset] = []
-        if !(try await screenAsset.loadTracks(withMediaType: .audio)).isEmpty {
-            audioAssets.append(screenAsset)
-        }
-        if let micPath = normalized.source.microphonePath {
-            let url = bundleURL.appendingPathComponent(micPath)
-            if FileManager.default.fileExists(atPath: url.path) {
-                audioAssets.append(AVURLAsset(url: url))
-            }
-        }
-        if let systemPath = normalized.source.systemAudioPath {
-            let url = bundleURL.appendingPathComponent(systemPath)
-            if FileManager.default.fileExists(atPath: url.path) {
-                audioAssets.append(AVURLAsset(url: url))
-            }
+        let mixer = TimelineAudioMixer(project: normalized, bundleURL: bundleURL)
+        var inputParameters = await mixer.addRecordedSources(to: composition)
+        inputParameters += await mixer.addClips(to: composition)
+
+        let audioMix: AVMutableAudioMix?
+        if inputParameters.isEmpty {
+            audioMix = nil
+        } else {
+            let mix = AVMutableAudioMix()
+            mix.inputParameters = inputParameters
+            audioMix = mix
         }
 
-        for asset in audioAssets {
-            guard let audioSource = try? await asset.loadTracks(withMediaType: .audio).first,
-                  let audioTrack = composition.addMutableTrack(
-                    withMediaType: .audio,
-                    preferredTrackID: kCMPersistentTrackID_Invalid
-                  ) else {
-                continue
-            }
-
-            var audioCursor = CMTime.zero
-            var inserted = false
-            for segment in map.segments where segment.rate > 0 && segment.sourceLengthMs > 0 {
-                let sourceRange = CMTimeRange(
-                    start: CMTime(seconds: segment.sourceStartMs / 1000, preferredTimescale: 600),
-                    duration: CMTime(seconds: segment.sourceLengthMs / 1000, preferredTimescale: 600)
-                )
-                let outputDuration = CMTime(
-                    seconds: segment.outputLengthMs / 1000,
-                    preferredTimescale: 600
-                )
-                do {
-                    try audioTrack.insertTimeRange(sourceRange, of: audioSource, at: audioCursor)
-                    if abs(segment.rate - 1) > 0.001, outputDuration > .zero {
-                        audioTrack.scaleTimeRange(
-                            CMTimeRange(start: audioCursor, duration: sourceRange.duration),
-                            toDuration: outputDuration
-                        )
-                    }
-                    audioCursor = CMTimeAdd(audioCursor, outputDuration)
-                    inserted = true
-                } catch {
-                    NSLog("Preview audio insert failed: \(error.localizedDescription)")
-                }
-            }
-            if !inserted {
-                composition.removeTrack(audioTrack)
-            }
-        }
-
-        return composition
+        return Preview(composition: composition, audioMix: audioMix)
     }
 }

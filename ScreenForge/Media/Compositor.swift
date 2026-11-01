@@ -51,6 +51,18 @@ struct QuadUniforms {
     var mirror: Float
     var pad1: Float
     var pad2: Float
+    var motionBlur: Float = 0
+    var blurDirX: Float = 0
+    var blurDirY: Float = 0
+    var sharpen: Float = 0
+    var grain: Float = 0
+    var gradeIndex: Float = 0
+    var gradeIntensity: Float = 1
+    var superRes: Float = 0
+    var hasLUT: Float = 0
+    var pad3: Float = 0
+    var pad4: Float = 0
+    var pad5: Float = 0
 }
 
 struct ShadowUniforms {
@@ -82,6 +94,7 @@ struct BackdropUniforms {
     var texelSize: SIMD2<Float>
     var radius: Float
     var dim: Float
+    var uvRect: SIMD4<Float>
 }
 
 // MARK: - Compositor
@@ -103,9 +116,12 @@ public final class Compositor: @unchecked Sendable {
     private var cursorTextures: [CursorTheme: MTLTexture] = [:]
     private var annotationTextures: [String: MTLTexture] = [:]
     private var captionTextures: [String: MTLTexture] = [:]
+    private var maskTextures: [String: MTLTexture] = [:]
+    private var lutTextures: [String: MTLTexture] = [:]
 
     private struct Pipelines {
         let textured: MTLRenderPipelineState
+        let cutout: MTLRenderPipelineState
         let cursor: MTLRenderPipelineState
         let solid: MTLRenderPipelineState
         let gradient: MTLRenderPipelineState
@@ -144,6 +160,7 @@ public final class Compositor: @unchecked Sendable {
 
         self.pipelines = Pipelines(
             textured: try Self.makePipeline(device: device, library: library, vertex: "quad_vertex", fragment: "textured_fragment"),
+            cutout: try Self.makePipeline(device: device, library: library, vertex: "quad_vertex", fragment: "cutout_fragment"),
             cursor: try Self.makePipeline(device: device, library: library, vertex: "quad_vertex", fragment: "cursor_fragment"),
             solid: try Self.makePipeline(device: device, library: library, vertex: "quad_vertex", fragment: "solid_fragment"),
             gradient: try Self.makePipeline(device: device, library: library, vertex: "quad_vertex", fragment: "gradient_fragment"),
@@ -220,6 +237,15 @@ public final class Compositor: @unchecked Sendable {
         drawBackground(state: state, screen: screen, canvas: canvas, encoder: encoder)
 
         if let screenRect = state.screenRect, screenRect.width > 1, screenRect.height > 1 {
+            if state.deviceMockup.kind != .none {
+                drawDeviceMockupBody(
+                    state: state,
+                    screenRect: screenRect,
+                    canvas: canvas,
+                    encoder: encoder
+                )
+            }
+            let screenLUT = lutTexture(for: state.screenGrade, bundleURL: state.bundleURL)
             if state.shadow.opacity > 0.001 {
                 drawShadow(
                     rect: screenRect,
@@ -230,6 +256,7 @@ public final class Compositor: @unchecked Sendable {
                 )
             }
             if let screen {
+                let usesLoupe = state.zoomKind == .loupe && state.zoomScale > 1.01
                 drawTextured(
                     screen,
                     rect: screenRect,
@@ -237,13 +264,34 @@ public final class Compositor: @unchecked Sendable {
                     cornerRadius: state.screenCornerRadius,
                     maskShape: 0,
                     opacity: 1,
-                    zoom: state.zoomScale,
-                    focusX: state.zoomFocus.x,
-                    focusY: state.zoomFocus.y,
+                    zoom: usesLoupe ? 1 : state.zoomScale,
+                    focusX: usesLoupe ? 0.5 : state.zoomFocus.x,
+                    focusY: usesLoupe ? 0.5 : state.zoomFocus.y,
                     mirrored: false,
                     pipeline: pipelines.textured,
-                    encoder: encoder
+                    encoder: encoder,
+                    motionBlur: usesLoupe ? 0 : state.motionBlur,
+                    motionDirection: state.motionBlurDirection,
+                    grain: state.screenGrade.grain,
+                    grade: state.screenGrade,
+                    superResolution: state.superResolution && !usesLoupe,
+                    lutTexture: screenLUT,
+                    tiltX: usesLoupe ? 0 : state.tiltX,
+                    tiltY: usesLoupe ? 0 : state.tiltY
                 )
+                if usesLoupe {
+                    drawLoupe(
+                        screen,
+                        screenRect: screenRect,
+                        zoom: state.zoomScale,
+                        focus: state.zoomFocus,
+                        grade: state.screenGrade,
+                        superResolution: state.superResolution,
+                        lutTexture: screenLUT,
+                        canvas: canvas,
+                        encoder: encoder
+                    )
+                }
             } else {
                 drawSolid(
                     color: SIMD4<Float>(0.10, 0.11, 0.13, 1),
@@ -251,6 +299,14 @@ public final class Compositor: @unchecked Sendable {
                     canvas: canvas,
                     cornerRadius: state.screenCornerRadius,
                     maskShape: 0,
+                    encoder: encoder
+                )
+            }
+            if state.deviceMockup.kind != .none {
+                drawDeviceMockupDetails(
+                    state: state,
+                    screenRect: screenRect,
+                    canvas: canvas,
                     encoder: encoder
                 )
             }
@@ -269,6 +325,8 @@ public final class Compositor: @unchecked Sendable {
                 }
                 let mask = maskCode(for: state.cameraMask)
                 if let camera {
+                    let maskTexture = state.personMaskURL.flatMap { maskTexture(for: $0) }
+                    let cameraLUT = lutTexture(for: state.cameraGrade, bundleURL: state.bundleURL)
                     drawTextured(
                         camera,
                         rect: cameraRect,
@@ -276,12 +334,16 @@ public final class Compositor: @unchecked Sendable {
                         cornerRadius: cameraCornerRadius(for: state.cameraMask, rect: cameraRect),
                         maskShape: mask,
                         opacity: state.cameraOpacity,
-                        zoom: 1,
-                        focusX: 0.5,
-                        focusY: 0.5,
+                        zoom: state.cameraZoom,
+                        focusX: state.cameraFocus.x,
+                        focusY: state.cameraFocus.y,
                         mirrored: state.cameraMirrored,
-                        pipeline: pipelines.textured,
-                        encoder: encoder
+                        pipeline: maskTexture == nil ? pipelines.textured : pipelines.cutout,
+                        encoder: encoder,
+                        sharpen: state.cameraSharpen,
+                        grade: state.cameraGrade,
+                        lutTexture: cameraLUT,
+                        personMask: maskTexture
                     )
                 } else {
                     drawSolid(
@@ -297,7 +359,12 @@ public final class Compositor: @unchecked Sendable {
             }
         }
 
-        drawAnnotations(state: state, canvas: canvas, encoder: encoder)
+        drawAnnotations(
+            state: state,
+            screen: screen,
+            canvas: canvas,
+            encoder: encoder
+        )
         drawCaption(state: state, canvas: canvas, encoder: encoder)
         drawCursor(state: state, canvas: canvas, encoder: encoder)
 
@@ -369,7 +436,8 @@ public final class Compositor: @unchecked Sendable {
                         1.0 / Float(max(screen.height, 1))
                     ),
                     radius: 18,
-                    dim: 0.55
+                    dim: 0.55,
+                    uvRect: SIMD4<Float>(0, 0, 1, 1)
                 )
                 encodeQuad(
                     pipeline: pipelines.backdrop,
@@ -421,7 +489,17 @@ public final class Compositor: @unchecked Sendable {
         focusY: Double,
         mirrored: Bool,
         pipeline: MTLRenderPipelineState,
-        encoder: MTLRenderCommandEncoder
+        encoder: MTLRenderCommandEncoder,
+        motionBlur: Double = 0,
+        motionDirection: CGPoint = .zero,
+        sharpen: Double = 0,
+        grain: Double = 0,
+        grade: ColorGrade = .none,
+        superResolution: Bool = false,
+        lutTexture: MTLTexture? = nil,
+        tiltX: Double = 0,
+        tiltY: Double = 0,
+        personMask: MTLTexture? = nil
     ) {
         var uniforms = QuadUniforms(
             color: SIMD4<Float>(1, 1, 1, 1),
@@ -442,6 +520,16 @@ public final class Compositor: @unchecked Sendable {
             pad1: 0,
             pad2: 0
         )
+        uniforms.motionBlur = Float(min(max(motionBlur, 0), 1))
+        uniforms.blurDirX = Float(motionDirection.x)
+        uniforms.blurDirY = Float(motionDirection.y)
+        uniforms.sharpen = Float(min(max(sharpen, 0), 1))
+        uniforms.grain = Float(min(max(grain, 0), 1))
+        uniforms.gradeIndex = grade.preset.shaderIndex
+        uniforms.gradeIntensity = Float(min(max(grade.intensity, 0), 1))
+        uniforms.superRes = superResolution ? 1 : 0
+        uniforms.hasLUT = lutTexture == nil ? 0 : 1
+
         encodeQuad(
             pipeline: pipeline,
             uniforms: &uniforms,
@@ -449,8 +537,225 @@ public final class Compositor: @unchecked Sendable {
             texture: texture,
             rect: rect,
             canvas: canvas,
+            encoder: encoder,
+            tiltX: tiltX,
+            tiltY: tiltY,
+            secondaryTexture: personMask,
+            lutTexture: lutTexture
+        )
+    }
+
+    // MARK: - Loupe
+
+    /// A glass magnifier placed over the focus point. The base frame stays at
+    /// 1× while a rounded lens samples the same texture at the zoom scale.
+    private func drawLoupe(
+        _ texture: MTLTexture,
+        screenRect: CGRect,
+        zoom: Double,
+        focus: CGPoint,
+        grade: ColorGrade,
+        superResolution: Bool,
+        lutTexture: MTLTexture?,
+        canvas: CGSize,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        let aspect = max(screenRect.width / max(screenRect.height, 1), 0.1)
+        let lensWidth = min(screenRect.width * 0.48, screenRect.width - 12)
+        let lensHeight = min(lensWidth / aspect, screenRect.height - 12)
+        let width = min(lensWidth, lensHeight * aspect)
+        let height = width / aspect
+        guard width > 20, height > 20 else { return }
+
+        let desiredX = screenRect.minX + focus.x * screenRect.width - width / 2
+        let desiredY = screenRect.minY + focus.y * screenRect.height - height / 2
+        let lens = CGRect(
+            x: min(max(desiredX, screenRect.minX + 4), screenRect.maxX - width - 4),
+            y: min(max(desiredY, screenRect.minY + 4), screenRect.maxY - height - 4),
+            width: width,
+            height: height
+        )
+        let radius = min(lens.width, lens.height) * 0.16
+
+        drawShadow(
+            rect: lens,
+            cornerRadius: radius,
+            shadow: ShadowSettings(angle: 90, distance: 0.008, blur: 0.035, opacity: 0.5),
+            canvas: canvas,
             encoder: encoder
         )
+
+        let border = lens.insetBy(dx: -3, dy: -3)
+        drawSolid(
+            color: SIMD4<Float>(1, 1, 1, 0.92),
+            rect: border,
+            canvas: canvas,
+            cornerRadius: radius + 3,
+            maskShape: 0,
+            encoder: encoder
+        )
+        drawTextured(
+            texture,
+            rect: lens,
+            canvas: canvas,
+            cornerRadius: radius,
+            maskShape: 0,
+            opacity: 1,
+            zoom: zoom,
+            focusX: focus.x,
+            focusY: focus.y,
+            mirrored: false,
+            pipeline: pipelines.textured,
+            encoder: encoder,
+            grade: grade,
+            superResolution: superResolution,
+            lutTexture: lutTexture
+        )
+    }
+
+    // MARK: - Device mockups
+
+    /// Draws the vector body of a device frame behind the screen pixels.
+    private func drawDeviceMockupBody(
+        state: RenderState,
+        screenRect: CGRect,
+        canvas: CGSize,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        let mockup = state.deviceMockup
+        let inset = mockup.bezel * min(screenRect.width, screenRect.height)
+        let body = screenRect.insetBy(dx: -inset, dy: -inset)
+        let radius = mockup.kind == .iPhone || mockup.kind == .iPad
+            ? inset * 2.6
+            : max(inset * 1.2, 4)
+
+        if state.shadow.opacity > 0.001 {
+            drawShadow(
+                rect: body,
+                cornerRadius: radius,
+                shadow: state.shadow,
+                canvas: canvas,
+                encoder: encoder
+            )
+        }
+
+        drawSolid(
+            color: ColorHex.rgba(mockup.colorHex),
+            rect: body,
+            canvas: canvas,
+            cornerRadius: radius,
+            maskShape: 0,
+            encoder: encoder
+        )
+
+        // A subtle inner edge keeps the body from looking like a flat rectangle.
+        drawSolid(
+            color: SIMD4<Float>(0, 0, 0, 0.18),
+            rect: body.insetBy(dx: inset * 0.35, dy: inset * 0.35),
+            canvas: canvas,
+            cornerRadius: max(radius - inset * 0.35, 2),
+            maskShape: 0,
+            encoder: encoder
+        )
+    }
+
+    /// Notches, home indicators, and MacBook base bars drawn over the screen.
+    private func drawDeviceMockupDetails(
+        state: RenderState,
+        screenRect: CGRect,
+        canvas: CGSize,
+        encoder: MTLRenderCommandEncoder
+    ) {
+        let mockup = state.deviceMockup
+        let inset = mockup.bezel * min(screenRect.width, screenRect.height)
+
+        switch mockup.kind {
+        case .iPhone:
+            let notchWidth = screenRect.width * 0.32
+            let notchHeight = max(inset * 0.85, 6)
+            let notch = CGRect(
+                x: screenRect.midX - notchWidth / 2,
+                y: screenRect.minY + notchHeight * 0.35,
+                width: notchWidth,
+                height: notchHeight
+            )
+            drawSolid(
+                color: SIMD4<Float>(0, 0, 0, 0.92),
+                rect: notch,
+                canvas: canvas,
+                cornerRadius: notchHeight / 2,
+                maskShape: 0,
+                encoder: encoder
+            )
+            let indicatorWidth = screenRect.width * 0.35
+            let indicator = CGRect(
+                x: screenRect.midX - indicatorWidth / 2,
+                y: screenRect.maxY - inset * 0.9,
+                width: indicatorWidth,
+                height: max(inset * 0.22, 3)
+            )
+            drawSolid(
+                color: SIMD4<Float>(1, 1, 1, 0.65),
+                rect: indicator,
+                canvas: canvas,
+                cornerRadius: indicator.height / 2,
+                maskShape: 0,
+                encoder: encoder
+            )
+
+        case .iPad:
+            let dot = max(inset * 0.35, 2)
+            drawSolid(
+                color: SIMD4<Float>(0, 0, 0, 0.75),
+                rect: CGRect(
+                    x: screenRect.midX - dot / 2,
+                    y: screenRect.minY + inset * 0.45,
+                    width: dot,
+                    height: dot
+                ),
+                canvas: canvas,
+                cornerRadius: dot / 2,
+                maskShape: 0,
+                encoder: encoder
+            )
+
+        case .macbook:
+            let baseWidth = screenRect.width + inset * 2.6
+            let baseHeight = max(inset * 0.9, 5)
+            let base = CGRect(
+                x: screenRect.midX - baseWidth / 2,
+                y: screenRect.maxY + inset * 0.9,
+                width: baseWidth,
+                height: baseHeight
+            )
+            drawSolid(
+                color: ColorHex.darkened(mockup.colorHex, by: 0.35),
+                rect: base,
+                canvas: canvas,
+                cornerRadius: baseHeight / 2,
+                maskShape: 0,
+                encoder: encoder
+            )
+
+        case .display:
+            let chin = CGRect(
+                x: screenRect.minX,
+                y: screenRect.maxY,
+                width: screenRect.width,
+                height: max(inset * 0.9, 4)
+            )
+            drawSolid(
+                color: ColorHex.rgba(mockup.colorHex),
+                rect: chin,
+                canvas: canvas,
+                cornerRadius: 2,
+                maskShape: 0,
+                encoder: encoder
+            )
+
+        case .none:
+            break
+        }
     }
 
     private func drawSolid(
@@ -461,8 +766,7 @@ public final class Compositor: @unchecked Sendable {
         maskShape: Int32,
         opacity: Double = 1,
         encoder: MTLRenderCommandEncoder
-    ) {
-        var uniforms = QuadUniforms(
+    ) {        var uniforms = QuadUniforms(
             color: color,
             cornerRadius: Float(max(cornerRadius, 0)),
             opacity: Float(min(max(opacity, 0), 1)),
@@ -531,37 +835,71 @@ public final class Compositor: @unchecked Sendable {
         texture: MTLTexture?,
         rect: CGRect,
         canvas: CGSize,
-        encoder: MTLRenderCommandEncoder
+        encoder: MTLRenderCommandEncoder,
+        tiltX: Double = 0,
+        tiltY: Double = 0,
+        secondaryTexture: MTLTexture? = nil,
+        lutTexture: MTLTexture? = nil
     ) {
         encoder.setRenderPipelineState(pipeline)
-        var transform = transform(for: rect, canvas: canvas)
+        var transform = transform(for: rect, canvas: canvas, tiltX: tiltX, tiltY: tiltY)
         encoder.setVertexBytes(&transform, length: MemoryLayout<simd_float4x4>.stride, index: 0)
         encoder.setFragmentBytes(uniforms, length: uniformLength, index: 0)
         if let texture {
             encoder.setFragmentTexture(texture, index: 0)
         }
+        if let secondaryTexture {
+            encoder.setFragmentTexture(secondaryTexture, index: 1)
+        }
+        if let lutTexture {
+            encoder.setFragmentTexture(lutTexture, index: secondaryTexture == nil ? 1 : 2)
+        }
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
     }
 
-    private func transform(for rect: CGRect, canvas: CGSize) -> simd_float4x4 {
+    private func transform(
+        for rect: CGRect,
+        canvas: CGSize,
+        tiltX: Double = 0,
+        tiltY: Double = 0
+    ) -> simd_float4x4 {
         let safeWidth = max(canvas.width, 1)
         let safeHeight = max(canvas.height, 1)
         let scaleX = Float(rect.width / safeWidth * 2)
         let scaleY = Float(rect.height / safeHeight * 2)
         let translateX = Float(rect.minX / safeWidth * 2 - 1)
         let translateY = Float(1 - rect.minY / safeHeight * 2)
-        return simd_float4x4(columns: (
+        let base = simd_float4x4(columns: (
             SIMD4<Float>(scaleX, 0, 0, 0),
             SIMD4<Float>(0, -scaleY, 0, 0),
             SIMD4<Float>(0, 0, 1, 0),
             SIMD4<Float>(translateX, translateY, 0, 1)
         ))
+
+        guard abs(tiltX) > 0.01 || abs(tiltY) > 0.01 else { return base }
+
+        let center = SIMD3<Float>(translateX, translateY, 0)
+        let radiansX = Float(tiltX * .pi / 180)
+        let radiansY = Float(tiltY * .pi / 180)
+        let rotateX = simd_float4x4(simd_quatf(angle: radiansX, axis: SIMD3<Float>(1, 0, 0)))
+        let rotateY = simd_float4x4(simd_quatf(angle: radiansY, axis: SIMD3<Float>(0, 1, 0)))
+
+        var perspective = matrix_identity_float4x4
+        perspective.columns.2.w = -1.0 / 6.0
+
+        var toOrigin = matrix_identity_float4x4
+        toOrigin.columns.3 = SIMD4<Float>(-center.x, -center.y, 0, 1)
+        var back = matrix_identity_float4x4
+        back.columns.3 = SIMD4<Float>(center.x, center.y, 0, 1)
+
+        return back * perspective * rotateY * rotateX * toOrigin * base
     }
 
     // MARK: - Annotations
 
     private func drawAnnotations(
         state: RenderState,
+        screen: MTLTexture?,
         canvas: CGSize,
         encoder: MTLRenderCommandEncoder
     ) {
@@ -630,14 +968,42 @@ public final class Compositor: @unchecked Sendable {
                 )
 
             case .blur:
-                drawSolid(
-                    color: SIMD4<Float>(0, 0, 0, 0.38),
-                    rect: box,
-                    canvas: canvas,
-                    cornerRadius: 10,
-                    maskShape: 0,
-                    encoder: encoder
-                )
+                if let screen, let screenRect = state.screenRect, screenRect.width > 1 {
+                    // True masked blur: sample the screen region under the mask and
+                    // run the separable Gaussian approximation in the backdrop shader.
+                    var uniforms = BackdropUniforms(
+                        texelSize: SIMD2<Float>(
+                            1.0 / Float(max(screen.width, 1)),
+                            1.0 / Float(max(screen.height, 1))
+                        ),
+                        radius: Float(max(annotation.mask?.intensity ?? 16, 4)),
+                        dim: 1.0,
+                        uvRect: SIMD4<Float>(
+                            Float((box.minX - screenRect.minX) / screenRect.width),
+                            Float((box.minY - screenRect.minY) / screenRect.height),
+                            Float(box.width / screenRect.width),
+                            Float(box.height / screenRect.height)
+                        )
+                    )
+                    encodeQuad(
+                        pipeline: pipelines.backdrop,
+                        uniforms: &uniforms,
+                        uniformLength: MemoryLayout<BackdropUniforms>.stride,
+                        texture: screen,
+                        rect: box,
+                        canvas: canvas,
+                        encoder: encoder
+                    )
+                } else {
+                    drawSolid(
+                        color: SIMD4<Float>(0, 0, 0, 0.55),
+                        rect: box,
+                        canvas: canvas,
+                        cornerRadius: 10,
+                        maskShape: 0,
+                        encoder: encoder
+                    )
+                }
 
             case .figure:
                 drawSolid(
@@ -951,6 +1317,101 @@ public final class Compositor: @unchecked Sendable {
         default:
             3
         }
+    }
+
+    // MARK: - LUT / person-matte textures
+
+    private func lutTexture(for grade: ColorGrade, bundleURL: URL?) -> MTLTexture? {
+        guard let path = grade.lutPath, let bundleURL else { return nil }
+        let url = bundleURL.appendingPathComponent(path)
+        let key = url.standardizedFileURL.path
+
+        lock.lock()
+        if let cached = lutTextures[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        guard let lut = try? CubeLUT(contentsOf: url) else { return nil }
+        guard let texture = makeLUTTexture(lut) else { return nil }
+
+        lock.lock()
+        if lutTextures.count > 16 {
+            lutTextures.removeAll(keepingCapacity: true)
+        }
+        lutTextures[key] = texture
+        lock.unlock()
+        return texture
+    }
+
+    private func makeLUTTexture(_ lut: CubeLUT) -> MTLTexture? {
+        let descriptor = MTLTextureDescriptor()
+        descriptor.textureType = .type3D
+        descriptor.pixelFormat = .rgba16Float
+        descriptor.width = lut.size
+        descriptor.height = lut.size
+        descriptor.depth = lut.size
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .managed
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+
+        var pixels = [UInt16](repeating: 0, count: lut.size * lut.size * lut.size * 4)
+        for index in 0..<(lut.size * lut.size * lut.size) {
+            let source = index * 3
+            let destination = index * 4
+            pixels[destination] = Float16(lut.entries[source]).bitPattern
+            pixels[destination + 1] = Float16(lut.entries[source + 1]).bitPattern
+            pixels[destination + 2] = Float16(lut.entries[source + 2]).bitPattern
+            pixels[destination + 3] = Float16(1).bitPattern
+        }
+
+        pixels.withUnsafeBytes { bytes in
+            texture.replace(
+                region: MTLRegionMake3D(0, 0, 0, lut.size, lut.size, lut.size),
+                mipmapLevel: 0,
+                slice: 0,
+                withBytes: bytes.baseAddress!,
+                bytesPerRow: lut.size * 8,
+                bytesPerImage: lut.size * lut.size * 8
+            )
+        }
+        return texture
+    }
+
+    private func maskTexture(for url: URL) -> MTLTexture? {
+        let key = url.standardizedFileURL.path
+
+        lock.lock()
+        if let cached = maskTextures[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return nil
+        }
+
+        let loader = MTKTextureLoader(device: device)
+        let options: [MTKTextureLoader.Option: Any] = [
+            .SRGB: false,
+            .origin: MTKTextureLoader.Origin.topLeft,
+            .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+            .textureStorageMode: NSNumber(value: MTLStorageMode.private.rawValue)
+        ]
+        guard let texture = try? loader.newTexture(cgImage: image, options: options) else {
+            return nil
+        }
+
+        lock.lock()
+        if maskTextures.count > 128 {
+            maskTextures.removeAll(keepingCapacity: true)
+        }
+        maskTextures[key] = texture
+        lock.unlock()
+        return texture
     }
 
     private func cameraCornerRadius(for mask: CameraMaskShape, rect: CGRect) -> CGFloat {

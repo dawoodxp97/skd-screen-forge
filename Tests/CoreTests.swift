@@ -223,7 +223,10 @@ struct ProjectCodecTests {
         let project = sampleProject()
         var data = try ProjectCodec.encode(project)
         let text = String(decoding: data, as: UTF8.self)
-            .replacingOccurrences(of: "\"schemaVersion\" : 1", with: "\"schemaVersion\" : 99")
+            .replacingOccurrences(
+                of: "\"schemaVersion\" : \(ScreenForgeProject.currentSchemaVersion)",
+                with: "\"schemaVersion\" : 99"
+            )
         data = Data(text.utf8)
         #expect(throws: ProjectError.self) {
             _ = try ProjectCodec.decode(data)

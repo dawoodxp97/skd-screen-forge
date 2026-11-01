@@ -34,12 +34,20 @@ public final class ProjectDocument: ObservableObject, Identifiable {
     @Published public var selectedSpeedID: String?
     @Published public var selectedAnnotationID: String?
     @Published public var selectedLayoutID: String?
+    @Published public var selectedMarkerID: String?
+    @Published public var selectedAudioClipID: String?
     @Published public private(set) var isDirty = false
     @Published public private(set) var canUndo = false
     @Published public private(set) var canRedo = false
     @Published public private(set) var lastSavedAt: Date?
     @Published public private(set) var isTranscribing = false
     @Published public private(set) var transcriptionStatus: String?
+    @Published public private(set) var isAnalyzing = false
+    @Published public private(set) var analysisStatus: String?
+    @Published public private(set) var isRecordingVoiceover = false
+    @Published public private(set) var voiceoverLevel: Float = 0
+    @Published public private(set) var presets: [ProjectPreset] = []
+    @Published public private(set) var isScanningSensitiveData = false
     @Published public var errorMessage: String?
     /// Non-blocking message shown in the editor (e.g. "nothing to suggest").
     @Published public var notice: String?
@@ -51,6 +59,9 @@ public final class ProjectDocument: ObservableObject, Identifiable {
     private var captionTrack: CaptionTrack?
     private var captionKey: CaptionKey?
     private var saveTask: Task<Void, Never>?
+    private var voiceoverRecorder: MicrophoneRecorder?
+    private var voiceoverStartOutputMs: Double = 0
+    private var voiceoverScratchURL: URL?
 
     private struct TrackKey: Equatable {
         var settings: CursorSettings
@@ -80,6 +91,7 @@ public final class ProjectDocument: ObservableObject, Identifiable {
         self.compositor = compositor
         self.transcript = transcript
         self.isDirty = false
+        Task { await self.refreshPresets() }
     }
 
     // MARK: - Derived state
@@ -138,6 +150,16 @@ public final class ProjectDocument: ObservableObject, Identifiable {
     public var selectedLayout: LayoutRegion? {
         guard let selectedLayoutID else { return nil }
         return project.timeline.layouts.first { $0.id == selectedLayoutID }
+    }
+
+    public var selectedMarker: TimelineMarker? {
+        guard let selectedMarkerID else { return nil }
+        return project.timeline.markers.first { $0.id == selectedMarkerID }
+    }
+
+    public var selectedAudioClip: AudioClip? {
+        guard let selectedAudioClipID else { return nil }
+        return project.timeline.audioClips.first { $0.id == selectedAudioClipID }
     }
 
     // MARK: - Editing
@@ -380,6 +402,557 @@ public final class ProjectDocument: ObservableObject, Identifiable {
         guard let selectedLayoutID else { return }
         apply { $0.timeline.layouts.removeAll { $0.id == selectedLayoutID } }
         self.selectedLayoutID = nil
+    }
+
+    // MARK: - Markers
+
+    @discardableResult
+    public func addMarker(
+        atOutputMs outputMs: Double,
+        label: String = "Marker",
+        kind: TimelineMarkerKind = .marker
+    ) -> TimelineMarker? {
+        let duration = max(outputDurationMs, 0)
+        guard duration > 0 else { return nil }
+        let time = Int(min(max(outputMs, 0), duration))
+        let marker = TimelineMarker(timeMs: time, label: label, kind: kind)
+        apply { $0.timeline.markers.append(marker) }
+        selectedMarkerID = marker.id
+        return marker
+    }
+
+    public func deleteSelectedMarker() {
+        guard let selectedMarkerID else { return }
+        apply { $0.timeline.markers.removeAll { $0.id == selectedMarkerID } }
+        self.selectedMarkerID = nil
+    }
+
+    public func deleteMarker(id: String) {
+        apply { $0.timeline.markers.removeAll { $0.id == id } }
+        if selectedMarkerID == id { selectedMarkerID = nil }
+    }
+
+    /// Converts every plain marker into a chapter cue. Chapters are exported as
+    /// metadata by tools that understand chapters; the editor still shows them on
+    /// the marker lane.
+    public func promoteMarkersToChapters() {
+        guard !project.timeline.markers.isEmpty else { return }
+        apply { project in
+            project.timeline.markers = project.timeline.markers.map { marker in
+                var copy = marker
+                copy.kind = .chapter
+                return copy
+            }
+        }
+    }
+
+    // MARK: - Audio clips
+
+    /// Copies an audio file into the project bundle and places it at output time.
+    @discardableResult
+    public func importAudio(
+        from url: URL,
+        kind: AudioClipKind,
+        atOutputMs outputMs: Double = 0
+    ) async -> AudioClip? {
+        do {
+            let asset = AVURLAsset(url: url)
+            let duration = try await asset.load(.duration)
+            let assetMs = max(Int((CMTimeGetSeconds(duration) * 1000).rounded()), 0)
+            guard assetMs > 50 else {
+                errorMessage = "That audio file is empty."
+                return nil
+            }
+
+            let existing = Set(project.timeline.audioClips.map { ($0.path as NSString).lastPathComponent })
+            let base = url.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: " ", with: "-")
+                .lowercased()
+            var candidate = "\(kind.rawValue)-\(base).\(url.pathExtension.lowercased())"
+            var counter = 2
+            while existing.contains(candidate) {
+                candidate = "\(kind.rawValue)-\(base)-\(counter).\(url.pathExtension.lowercased())"
+                counter += 1
+            }
+
+            let storedPath = try await ProjectStore.shared.importMedia(
+                from: url,
+                into: bundleURL,
+                preferredName: candidate
+            )
+            let start = Int(min(max(outputMs, 0), max(outputDurationMs, 0)))
+            let available = max(Int(outputDurationMs) - start, assetMs)
+            let length = min(assetMs, max(available, 50))
+            let clip = AudioClip(
+                kind: kind,
+                path: storedPath,
+                label: base.replacingOccurrences(of: "-", with: " ").capitalized,
+                startMs: start,
+                durationMs: length,
+                volume: kind == .music ? 0.8 : 1,
+                fadeInMs: kind == .music ? 800 : 0,
+                fadeOutMs: kind == .music ? 1_200 : 0,
+                loops: false
+            )
+            apply { $0.timeline.audioClips.append(clip) }
+            selectedAudioClipID = clip.id
+            errorMessage = nil
+            return clip
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    @discardableResult
+    public func addGeneratedTone(
+        kind: AudioClipKind = .soundEffect,
+        atOutputMs outputMs: Double,
+        durationMs: Int = 600
+    ) async -> AudioClip? {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForge-tone-\(UUID().uuidString).caf")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let sampleRate = 48_000.0
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
+              let file = try? AVAudioFile(
+                forWriting: url,
+                settings: [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: sampleRate,
+                    AVNumberOfChannelsKey: 1,
+                    AVLinearPCMBitDepthKey: 32,
+                    AVLinearPCMIsFloatKey: true
+                ],
+                commonFormat: .pcmFormatFloat32,
+                interleaved: false
+              ) else {
+            return nil
+        }
+
+        let frames = AVAudioFrameCount(Double(durationMs) / 1000 * sampleRate)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+        buffer.frameLength = frames
+        if let channel = buffer.floatChannelData?[0] {
+            for index in 0..<Int(frames) {
+                let t = Double(index) / sampleRate
+                let envelope = max(0, 1 - t / max(Double(durationMs) / 1000, 0.01))
+                channel[index] = Float(sin(2 * .pi * 660 * t) * 0.18 * envelope)
+            }
+        }
+        try? file.write(from: buffer)
+        return await importAudio(from: url, kind: kind, atOutputMs: outputMs)
+    }
+
+    public func deleteSelectedAudioClip() {
+        guard let selectedAudioClipID else { return }
+        apply { $0.timeline.audioClips.removeAll { $0.id == selectedAudioClipID } }
+        self.selectedAudioClipID = nil
+    }
+
+    public func deleteAudioClip(id: String) {
+        apply { $0.timeline.audioClips.removeAll { $0.id == id } }
+        if selectedAudioClipID == id { selectedAudioClipID = nil }
+    }
+
+    // MARK: - Analysis
+
+    /// Detects speech gaps in the microphone track and stores the ranges with the
+    /// project. The camera can then fade out while nobody is speaking.
+    public func detectSilence() async {
+        guard !isAnalyzing else { return }
+        guard let micPath = project.source.microphonePath else {
+            notice = "Silence detection needs a microphone track. This project has none."
+            return
+        }
+        isAnalyzing = true
+        analysisStatus = "Listening for silence…"
+        defer { isAnalyzing = false }
+
+        do {
+            let url = bundleURL.appendingPathComponent(micPath)
+            let ranges = try await SilenceDetector.detect(in: url)
+            apply { project in
+                project.analysis.silenceRanges = ranges
+                if !ranges.isEmpty {
+                    project.camera.hideDuringSilence = true
+                }
+            }
+            analysisStatus = ranges.isEmpty
+                ? "No silence found"
+                : "\(ranges.count) silent range\(ranges.count == 1 ? "" : "s")"
+        } catch {
+            analysisStatus = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Samples the webcam with Vision and stores face centers for reframing.
+    public func analyzeFaces() async {
+        guard !isAnalyzing else { return }
+        guard let webcamPath = project.source.webcamPath else {
+            notice = "Face tracking needs a camera track. This project has none."
+            return
+        }
+        isAnalyzing = true
+        analysisStatus = "Finding faces…"
+        defer { isAnalyzing = false }
+
+        do {
+            let url = bundleURL.appendingPathComponent(webcamPath)
+            let samples = try await FaceDetector.detect(in: url)
+            apply { project in
+                project.analysis.faceSamples = samples
+                if !samples.isEmpty {
+                    project.camera.faceTracking = true
+                }
+            }
+            analysisStatus = samples.isEmpty
+                ? "No face found"
+                : "\(samples.count) face samples"
+        } catch {
+            analysisStatus = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Voiceover
+
+    /// Starts recording a voiceover from the microphone at the current output time.
+    /// Call `stopVoiceover` to convert it and place it on the audio lane.
+    public func startVoiceover(atOutputMs outputMs: Double) async {
+        guard !isRecordingVoiceover else { return }
+        let granted = await MicrophoneRecorder.requestPermission()
+        guard granted else {
+            errorMessage = MicrophoneError.permissionDenied.errorDescription
+            return
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForge-voiceover-\(UUID().uuidString).caf")
+        let recorder = MicrophoneRecorder()
+        do {
+            try recorder.start(url: url, enableVoiceProcessing: true)
+            voiceoverRecorder = recorder
+            voiceoverScratchURL = url
+            voiceoverStartOutputMs = min(max(outputMs, 0), max(outputDurationMs, 0))
+            isRecordingVoiceover = true
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    public func stopVoiceover() async -> AudioClip? {
+        guard let recorder = voiceoverRecorder else { return nil }
+        recorder.stop()
+        voiceoverRecorder = nil
+        isRecordingVoiceover = false
+        voiceoverLevel = 0
+
+        guard let scratch = voiceoverScratchURL else { return nil }
+        voiceoverScratchURL = nil
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let converted = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForge-voiceover-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: converted) }
+
+        do {
+            try await AudioTranscoder.toM4A(input: scratch, output: converted)
+            return await importAudio(
+                from: converted,
+                kind: .voiceover,
+                atOutputMs: voiceoverStartOutputMs
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    public func cancelVoiceover() {
+        voiceoverRecorder?.stop()
+        voiceoverRecorder = nil
+        isRecordingVoiceover = false
+        voiceoverLevel = 0
+        if let scratch = voiceoverScratchURL {
+            try? FileManager.default.removeItem(at: scratch)
+        }
+        voiceoverScratchURL = nil
+    }
+
+    // MARK: - Background image
+
+    /// Imports a custom background image and switches the canvas to it.
+    public func importBackgroundImage(from url: URL) async {
+        do {
+            let name = "background-\(UUID().uuidString.prefix(8)).\(url.pathExtension.lowercased())"
+            let path = try await ProjectStore.shared.importMedia(
+                from: url,
+                into: bundleURL,
+                preferredName: name
+            )
+            apply { project in
+                project.canvas.background = BackgroundStyle(
+                    kind: .image,
+                    identifier: "custom",
+                    colors: project.canvas.background.colors,
+                    imagePath: path
+                )
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Advanced analysis / looks
+
+    /// Segments the camera track and stores person-matte PNGs with the project.
+    public func generatePersonMatte() async {
+        guard !isAnalyzing else { return }
+        guard let webcamPath = project.source.webcamPath else {
+            notice = "Person cutout needs a camera track. This project has none."
+            return
+        }
+        isAnalyzing = true
+        analysisStatus = "Building person matte…"
+        defer { isAnalyzing = false }
+
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForge-matte-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        do {
+            let url = bundleURL.appendingPathComponent(webcamPath)
+            let result = try await PersonMatteDetector.detect(in: url, outputDirectory: temp)
+            guard !result.frames.isEmpty else {
+                analysisStatus = "No person found in the camera track"
+                return
+            }
+
+            var frames: [PersonMaskFrame] = []
+            for frame in result.frames {
+                let source = temp.appendingPathComponent(frame.fileName)
+                let stored = try await ProjectStore.shared.importMedia(
+                    from: source,
+                    into: bundleURL,
+                    preferredName: "person-mask-\(frame.fileName)"
+                )
+                frames.append(PersonMaskFrame(timeMs: frame.timeMs, path: stored))
+            }
+
+            apply { project in
+                project.analysis.personMasks = frames
+                project.camera.enabled = true
+                project.camera.cutout = true
+            }
+            analysisStatus = "\(frames.count) matte frames"
+            errorMessage = nil
+        } catch {
+            analysisStatus = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Scans the screen recording for faces and sensitive text, then adds masks.
+    public func scanForSensitiveData(
+        detectText: Bool = true,
+        detectFaces: Bool = true,
+        customPhrases: [String] = [],
+        expandPoints: Double = 8
+    ) async {
+        guard !isScanningSensitiveData else { return }
+        isScanningSensitiveData = true
+        analysisStatus = "Scanning for sensitive data…"
+        defer { isScanningSensitiveData = false }
+
+        do {
+            let url = bundleURL.appendingPathComponent(project.source.screenPath)
+            var options = SensitiveDataScanner.Options()
+            options.detectText = detectText
+            options.detectFaces = detectFaces
+            options.customPhrases = customPhrases
+            options.expandPoints = expandPoints
+            let detections = try await SensitiveDataScanner.scan(in: url, options: options)
+
+            apply { project in
+                project.timeline.annotations.removeAll { $0.generated == true }
+                var z = (project.timeline.annotations.map(\.zIndex).max() ?? 0)
+                for detection in detections {
+                    z += 1
+                    let rect = NormalizedRect(
+                        x: Double(detection.rect.minX),
+                        y: Double(detection.rect.minY),
+                        width: Double(detection.rect.width),
+                        height: Double(detection.rect.height)
+                    ).clamped()
+                    let mask = MaskSettings(
+                        kind: .blur,
+                        intensity: detection.kind == .face ? 26 : 20,
+                        blockSize: 14,
+                        cornerRadius: 6
+                    )
+                    let style = AnnotationStyle(
+                        colorHex: detection.kind == .face ? "#64D2FF" : "#FFD60A",
+                        backgroundHex: "#00000000"
+                    )
+                    project.timeline.annotations.append(
+                        AnnotationRegion(
+                            type: .blur,
+                            startMs: detection.startMs,
+                            endMs: detection.endMs,
+                            text: detection.text,
+                            rect: rect,
+                            style: style,
+                            zIndex: z,
+                            mask: mask,
+                            generated: true
+                        )
+                    )
+                }
+            }
+            analysisStatus = detections.isEmpty
+                ? "No sensitive regions found"
+                : "\(detections.count) masks added"
+            errorMessage = nil
+        } catch {
+            analysisStatus = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func clearGeneratedMasks() {
+        apply { $0.timeline.annotations.removeAll { $0.generated == true } }
+        analysisStatus = nil
+    }
+
+    // MARK: - Wallpapers / LUTs / clicks
+
+    /// Renders a built-in wallpaper and switches the canvas to it.
+    public func applyWallpaper(_ preset: WallpaperPreset) async {
+        do {
+            let temp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ScreenForge-wallpapers", isDirectory: true)
+            let rendered = try WallpaperLibrary.write(preset, to: temp)
+            let path = try await ProjectStore.shared.importMedia(
+                from: rendered,
+                into: bundleURL,
+                preferredName: "wallpaper-\(preset.id).png"
+            )
+            apply { project in
+                project.canvas.background = BackgroundStyle(
+                    kind: .image,
+                    identifier: preset.id,
+                    colors: preset.colors,
+                    imagePath: path
+                )
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Imports a `.cube` LUT and applies it to the screen layer.
+    public func importLUT(from url: URL) async {
+        do {
+            _ = try CubeLUT(contentsOf: url)
+            let path = try await ProjectStore.shared.importMedia(
+                from: url,
+                into: bundleURL,
+                preferredName: "grade-\(UUID().uuidString.prefix(8)).cube"
+            )
+            apply { project in
+                project.canvas.grade.lutPath = path
+                project.canvas.grade.preset = .none
+                project.canvas.grade.intensity = 1
+            }
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func clearLUT() {
+        apply { project in
+            project.canvas.grade.lutPath = nil
+            project.canvas.grade.preset = .none
+        }
+    }
+
+    /// Builds a click-sound track from cursor telemetry and adds it as an audio clip.
+    public func addClickSounds(packID: String) async {
+        guard !cursorSamples.isEmpty else {
+            notice = "Click sounds need cursor telemetry in this recording."
+            return
+        }
+        let pack = ClickSoundLibrary.pack(id: packID) ?? ClickSoundLibrary.packs[0]
+        do {
+            let result = try ClickTrackBuilder.build(
+                cursorSamples: cursorSamples,
+                map: map,
+                outputDurationMs: Int(outputDurationMs),
+                pack: pack
+            )
+            defer { try? FileManager.default.removeItem(at: result.url) }
+            let path = try await ProjectStore.shared.importMedia(
+                from: result.url,
+                into: bundleURL,
+                preferredName: "clicks-\(pack.id).caf"
+            )
+            let clip = AudioClip(
+                kind: .soundEffect,
+                path: path,
+                label: "Click sounds",
+                startMs: 0,
+                durationMs: Int(outputDurationMs),
+                volume: project.audio.clickSoundVolume,
+                muted: false
+            )
+            apply { project in
+                project.timeline.audioClips.removeAll { $0.label == "Click sounds" }
+                project.timeline.audioClips.append(clip)
+                project.cursor.clickSound = pack.id
+            }
+            selectedAudioClipID = clip.id
+            notice = "Added \(result.clickCount) click sounds"
+            errorMessage = nil
+        } catch {
+            errorMessage = "Could not build click sounds from this recording."
+        }
+    }
+
+    // MARK: - Presets
+
+    public func refreshPresets() async {
+        presets = await ProjectPresetStore.shared.list()
+    }
+
+    public func savePreset(named name: String) async {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let preset = ProjectPreset(name: trimmed, project: project)
+        do {
+            try await ProjectPresetStore.shared.save(preset)
+            await refreshPresets()
+            notice = "Saved preset “\(trimmed)”"
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func applyPreset(_ preset: ProjectPreset) {
+        apply { preset.apply(to: &$0) }
+        notice = "Applied preset “\(preset.name)”"
+    }
+
+    public func deletePreset(_ preset: ProjectPreset) async {
+        await ProjectPresetStore.shared.delete(id: preset.id)
+        await refreshPresets()
     }
 
     // MARK: - Transcript

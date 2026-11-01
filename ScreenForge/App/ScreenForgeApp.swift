@@ -86,6 +86,9 @@ struct RootView: View {
         .animation(.easeInOut(duration: 0.22), value: app.mode)
         .animation(.easeInOut(duration: 0.18), value: app.countdownValue)
         .animation(.easeInOut(duration: 0.2), value: app.statusMessage)
+        .sheet(isPresented: $app.showLicensePanel) {
+            LicenseView()
+        }
         .alert(
             "ScreenForge",
             isPresented: Binding(
@@ -198,6 +201,31 @@ struct ScreenForgeCommands: Commands {
             .disabled(app.document?.canRedo != true)
         }
 
+        CommandMenu("Marker") {
+            Button("Add Marker") {
+                if app.recordingPhase == .recording || app.recordingPhase == .paused {
+                    Task { await app.addRecordingMarker() }
+                } else if let document = app.document {
+                    document.addMarker(atOutputMs: 0)
+                }
+            }
+            .keyboardShortcut("m", modifiers: .command)
+            .disabled(app.document == nil && app.recordingPhase == .idle)
+
+            Button("Flag Moment") {
+                Task { await app.addRecordingMarker(kind: .flag) }
+            }
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+            .disabled(app.recordingPhase != .recording && app.recordingPhase != .paused)
+
+            Divider()
+
+            Button("Promote Markers to Chapters") {
+                app.document?.promoteMarkersToChapters()
+            }
+            .disabled(app.document?.project.timeline.markers.isEmpty != false)
+        }
+
         CommandMenu("Project") {
             Button("Close Project") {
                 app.closeProject()
@@ -224,11 +252,46 @@ struct ScreenForgeCommands: Commands {
             .keyboardShortcut("e", modifiers: [.command, .shift])
             .disabled(app.document == nil || app.isExporting)
 
+            Divider()
+
+            Button("Share Last Export…") {
+                app.shareLastExport()
+            }
+            .disabled(app.lastExportURL == nil)
+
+            Button("Copy Share Link") {
+                Task { await app.createShareLink() }
+            }
+            .disabled(app.lastExportURL == nil)
+
+            Button("Share via AirDrop") {
+                app.shareLastExportViaAirDrop()
+            }
+            .disabled(app.lastExportURL == nil)
+
             if app.isExporting {
                 Divider()
                 Button("Cancel Export") {
                     app.cancelExport()
                 }
+            }
+
+            Divider()
+
+            Button("Check for Updates…") {
+                Task { await app.checkForUpdates() }
+            }
+
+            if let update = app.lastUpdate {
+                Button("Download \(update.version)") {
+                    NSWorkspace.shared.open(update.downloadURL)
+                }
+            }
+
+            Divider()
+
+            Button("License…") {
+                app.showLicensePanel = true
             }
         }
     }

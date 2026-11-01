@@ -80,6 +80,7 @@ public struct RenderState: Sendable {
     public var screenCornerRadius: CGFloat
     public var zoomScale: Double
     public var zoomFocus: CGPoint
+    public var zoomKind: ZoomKind = .classic
     public var rotation: Rotation3DPreset?
 
     public var background: BackgroundStyle
@@ -87,10 +88,23 @@ public struct RenderState: Sendable {
     public var shadow: ShadowSettings
     public var bundleURL: URL?
 
+    public var screenGrade: ColorGrade = .none
+    public var superResolution: Bool = false
+    public var motionBlur: Double = 0
+    public var motionBlurDirection: CGPoint = .zero
+    public var tiltX: Double = 0
+    public var tiltY: Double = 0
+    public var deviceMockup: DeviceMockup = .none
+
     public var cameraRect: CGRect?
     public var cameraMask: CameraMaskShape
     public var cameraMirrored: Bool
     public var cameraOpacity: Double
+    public var cameraZoom: Double = 1
+    public var cameraFocus: CGPoint = .init(x: 0.5, y: 0.5)
+    public var cameraGrade: ColorGrade = .none
+    public var cameraSharpen: Double = 0
+    public var personMaskURL: URL?
 
     public var layout: LayoutKind
     public var previousLayout: LayoutKind?
@@ -169,7 +183,16 @@ public struct FrameRenderer: Sendable {
         let layout = resolvedLayout(at: Int(sourceMs))
         // Zoom is resolved first: the overlay PiP shrinks relative to it.
         let zoom = resolvedZoom(at: Int(sourceMs))
-        let frames = layoutFrames(for: layout.kind, canvas: canvas, zoomScale: zoom.scale)
+        let previousZoom = resolvedZoom(at: max(Int(sourceMs) - 34, 0))
+        var frames = layoutFrames(for: layout.kind, canvas: canvas, zoomScale: zoom.scale)
+
+        // Device mockups wrap the screen layer in a vector body and inset the pixels.
+        if project.canvas.deviceMockup.kind != .none, var screen = frames.screen {
+            let inset = project.canvas.deviceMockup.bezel * min(screen.width, screen.height)
+            screen = screen.insetBy(dx: inset, dy: inset)
+            frames.screen = screen
+        }
+
         let cameraEnabled = project.camera.enabled || layout.kind != .screenOnly
 
         let screenRect = frames.screen
@@ -228,6 +251,45 @@ public struct FrameRenderer: Sendable {
             return bundleURL?.appendingPathComponent(path)
         }()
 
+        let face = project.camera.faceTracking ? analysisFace(at: Int(sourceMs)) : nil
+        let cameraZoom = face == nil ? 1 : 1.28
+        let cameraFocus = face.map { CGPoint(x: $0.x, y: $0.y) } ?? CGPoint(x: 0.5, y: 0.5)
+        let cameraOpacity: Double = {
+            guard cameraEnabled, layout.kind != .screenOnly else { return 0 }
+            guard project.camera.hideDuringSilence else { return 1 }
+            return project.analysis.cameraOpacity(atSourceMs: Int(sourceMs))
+        }()
+
+        // Motion blur follows the zoom's own movement: focus travel plus scale change.
+        let focusDX = zoom.focus.x - previousZoom.focus.x
+        let focusDY = zoom.focus.y - previousZoom.focus.y
+        let scaleDelta = abs(zoom.scale - previousZoom.scale)
+        let movement = min(hypot(focusDX, focusDY) * 6 + scaleDelta * 1.5, 1)
+        var blurDirection = CGPoint(x: focusDX, y: focusDY)
+        if hypot(blurDirection.x, blurDirection.y) < 0.0001, scaleDelta > 0.0001 {
+            // Radial component for pure zoom: blur outward from the focus.
+            blurDirection = CGPoint(x: zoom.focus.x - 0.5, y: zoom.focus.y - 0.5)
+        }
+        let directionLength = hypot(blurDirection.x, blurDirection.y)
+        if directionLength > 0.0001 {
+            blurDirection = CGPoint(
+                x: blurDirection.x / directionLength,
+                y: blurDirection.y / directionLength
+            )
+        }
+        let motionBlur = project.canvas.motionBlur * movement * (zoom.scale > 1.001 ? 1 : 0.35)
+
+        let personMaskURL: URL? = {
+            guard project.camera.cutout,
+                  let frame = project.analysis.personMask(atSourceMs: Int(sourceMs)) else { return nil }
+            return bundleURL?.appendingPathComponent(frame.path)
+        }()
+
+        let tilt = zoom.rotation?.angles
+        let tiltStrength = max(zoom.scale - 1, 0) / 4
+        let tiltX = (tilt?.x ?? 0) * tiltStrength
+        let tiltY = (tilt?.y ?? 0) * tiltStrength
+
         return RenderState(
             outputTimeMs: clampedOutput,
             sourceTimeMs: sourceMs,
@@ -236,15 +298,28 @@ public struct FrameRenderer: Sendable {
             screenCornerRadius: screenCorner,
             zoomScale: zoom.scale,
             zoomFocus: zoom.focus,
+            zoomKind: zoom.kind,
             rotation: zoom.rotation,
             background: project.canvas.background,
             backgroundImageURL: backgroundURL,
             shadow: project.canvas.shadow,
             bundleURL: bundleURL,
+            screenGrade: project.canvas.grade,
+            superResolution: project.canvas.superResolution,
+            motionBlur: motionBlur,
+            motionBlurDirection: blurDirection,
+            tiltX: tiltX,
+            tiltY: tiltY,
+            deviceMockup: project.canvas.deviceMockup,
             cameraRect: cameraEnabled ? frames.camera : nil,
             cameraMask: maskShape(),
             cameraMirrored: project.camera.mirrored,
-            cameraOpacity: layout.kind == .screenOnly ? 0 : 1,
+            cameraOpacity: cameraOpacity,
+            cameraZoom: cameraZoom,
+            cameraFocus: cameraFocus,
+            cameraGrade: project.camera.grade,
+            cameraSharpen: project.camera.sharpen,
+            personMaskURL: personMaskURL,
             layout: layout.kind,
             previousLayout: layout.previous,
             layoutBlend: layout.blend,
@@ -259,6 +334,15 @@ public struct FrameRenderer: Sendable {
             annotations: project.timeline.annotations(at: Int(sourceMs)),
             caption: resolvedCaption(at: Int(sourceMs), canvas: canvas)
         )
+    }
+
+    private func analysisFace(at sourceMs: Int) -> FaceSample? {
+        guard let sample = project.analysis.faceSamples.last(where: { $0.timeMs <= sourceMs }) else {
+            return project.analysis.faceSamples.first
+        }
+        // Ignore stale detections (e.g. the person left the frame).
+        guard sourceMs - sample.timeMs < 1_500, sample.confidence > 0.25 else { return nil }
+        return sample
     }
 
     /// Active caption line for a source timestamp. Disabled captions or gaps between
@@ -306,6 +390,7 @@ public struct FrameRenderer: Sendable {
     private struct ResolvedZoom {
         var scale: Double
         var focus: CGPoint
+        var kind: ZoomKind
         var rotation: Rotation3DPreset?
     }
 
@@ -313,7 +398,12 @@ public struct FrameRenderer: Sendable {
         let active = project.timeline.zooms
             .filter { sourceMs >= $0.startMs && sourceMs <= $0.endMs }
         guard let strongest = active.max(by: { $0.scale < $1.scale }) else {
-            return ResolvedZoom(scale: 1, focus: .init(x: 0.5, y: 0.5), rotation: nil)
+            return ResolvedZoom(
+                scale: 1,
+                focus: .init(x: 0.5, y: 0.5),
+                kind: .classic,
+                rotation: nil
+            )
         }
 
         let duration = Double(max(strongest.endMs - strongest.startMs, 1))
@@ -333,6 +423,7 @@ public struct FrameRenderer: Sendable {
         return ResolvedZoom(
             scale: scale,
             focus: CGPoint(x: strongest.focus.x, y: strongest.focus.y),
+            kind: strongest.kind,
             rotation: strongest.rotation
         )
     }
@@ -446,11 +537,12 @@ public struct FrameRenderer: Sendable {
     }
 
     private func maskShape() -> CameraMaskShape {
+        if project.camera.cutout { return .cutout }
         switch project.camera.mask {
-        case .rectangle: .none
-        case .rounded: .rounded(radius: 0.16)
-        case .circle: .circle
-        case .square: .square
+        case .rectangle: return .none
+        case .rounded: return .rounded(radius: 0.16)
+        case .circle: return .circle
+        case .square: return .square
         }
     }
 

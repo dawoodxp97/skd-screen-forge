@@ -53,6 +53,9 @@ public enum RecordingRecovery {
     ) async throws -> URL {
         let cursorURL = session.directory.appendingPathComponent(ProjectBundleLayout.cursorFileName)
         let samples = (try? CursorJSONL.load(from: cursorURL)) ?? []
+        let markerURL = session.directory.appendingPathComponent("markers.json")
+        let markers = (try? Data(contentsOf: markerURL))
+            .flatMap { try? JSONDecoder().decode([TimelineMarker].self, from: $0) } ?? []
 
         let name = "\(session.manifest.displayName) (Recovered)"
         let result = try await RecordingFinalizer.makeProject(
@@ -60,6 +63,7 @@ public enum RecordingRecovery {
             manifest: session.manifest,
             cursorSamples: samples,
             pauses: session.manifest.pauses,
+            markers: markers,
             outputDirectory: outputDirectory,
             projectName: name
         )

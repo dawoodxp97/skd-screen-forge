@@ -135,7 +135,12 @@ public final class Exporter: @unchecked Sendable {
                 .appendingPathComponent("ScreenForge-\(UUID().uuidString)-gif-source.mp4")
             defer { try? FileManager.default.removeItem(at: movie) }
 
-            _ = try await exportMovie(job: job, destination: movie, progress: progress)
+            // GIF conversion needs a broadly decodable intermediate, regardless of
+            // the project's delivery codec.
+            var gifJob = job
+            gifJob.project.export.codec = .h264
+            gifJob.project.export.resolution = .p720
+            _ = try await exportMovie(job: gifJob, destination: movie, progress: progress)
             progress(ExportProgress(phase: .finishing, fraction: 0.95, message: "Encoding GIF"))
             return try await GifExporter.convert(
                 movieURL: movie,
@@ -206,8 +211,9 @@ public final class Exporter: @unchecked Sendable {
         )
 
         let tempDirectory = FileManager.default.temporaryDirectory
-        let isMP4 = destination.pathExtension.lowercased() != "mov"
-        let containerExtension = isMP4 ? "mp4" : "mov"
+        let isProRes = settings.codec.isProRes
+        let containerExtension = isProRes ? "mov" : "mp4"
+        let outputFileType: AVFileType = isProRes ? .mov : .mp4
         let tempVideo = tempDirectory
             .appendingPathComponent("ScreenForge-\(UUID().uuidString)-video.\(containerExtension)")
         let tempAudio = tempDirectory
@@ -219,7 +225,7 @@ public final class Exporter: @unchecked Sendable {
         }
 
         // 1. Render video-only.
-        let writer = try AVAssetWriter(outputURL: tempVideo, fileType: isMP4 ? .mp4 : .mov)
+        let writer = try AVAssetWriter(outputURL: tempVideo, fileType: outputFileType)
         let videoSettings = Self.videoSettings(
             width: Int(canvas.width),
             height: Int(canvas.height),
@@ -363,7 +369,6 @@ public final class Exporter: @unchecked Sendable {
         let hasAudio = try await buildAudio(
             project: project,
             bundleURL: job.bundleURL,
-            map: map,
             outputDurationMs: outputDurationMs,
             destination: tempAudio
         )
@@ -379,10 +384,22 @@ public final class Exporter: @unchecked Sendable {
                 videoURL: tempVideo,
                 audioURL: tempAudio,
                 destination: destination,
-                outputFileType: isMP4 ? .mp4 : .mov
+                outputFileType: outputFileType
             )
         } else {
             try FileManager.default.moveItem(at: tempVideo, to: destination)
+        }
+
+        // 4. Chapters (markers promoted to chapters) live in moov/udta/chpl.
+        let chapters = project.timeline.markers
+            .filter { $0.kind == .chapter }
+            .map { ChapterWriter.Chapter(timeMs: $0.timeMs, title: $0.label) }
+        if !chapters.isEmpty {
+            do {
+                try ChapterWriter.write(chapters: chapters, to: destination)
+            } catch {
+                NSLog("Chapter metadata failed: \(error.localizedDescription)")
+            }
         }
 
         progress(ExportProgress(phase: .finishing, fraction: 1, message: "Export complete"))
@@ -393,79 +410,26 @@ public final class Exporter: @unchecked Sendable {
 
     /// Builds an audio-only movie for the edited timeline. Returns false when the
     /// project has no audio at all.
+    ///
+    /// Every source gets its own composition track so gains, fades, and ducking can
+    /// be expressed as independent audio-mix ramps. Timeline clips use output time,
+    /// so they stay attached to the visible edit through cuts and speed changes.
     private func buildAudio(
         project: ScreenForgeProject,
         bundleURL: URL,
-        map: TimelineMap,
         outputDurationMs: Double,
         destination: URL
     ) async throws -> Bool {
-        var sources: [AVURLAsset] = []
-        let screenURL = bundleURL.appendingPathComponent(project.source.screenPath)
-        let screenAsset = AVURLAsset(url: screenURL)
-        if !(try await screenAsset.loadTracks(withMediaType: .audio)).isEmpty {
-            sources.append(screenAsset)
-        }
-        if let micPath = project.source.microphonePath {
-            let micURL = bundleURL.appendingPathComponent(micPath)
-            if FileManager.default.fileExists(atPath: micURL.path) {
-                sources.append(AVURLAsset(url: micURL))
-            }
-        }
-        if let systemPath = project.source.systemAudioPath {
-            let url = bundleURL.appendingPathComponent(systemPath)
-            if FileManager.default.fileExists(atPath: url.path) {
-                sources.append(AVURLAsset(url: url))
-            }
-        }
-        guard !sources.isEmpty else { return false }
+        guard project.export.includeAudio else { return false }
 
+        let mixer = TimelineAudioMixer(project: project, bundleURL: bundleURL)
         let composition = AVMutableComposition()
-        var insertedTracks = 0
+        var inputParameters = await mixer.addRecordedSources(to: composition)
+        inputParameters += await mixer.addClips(to: composition)
 
-        for asset in sources {
-            guard let sourceTrack = try await asset.loadTracks(withMediaType: .audio).first,
-                  let compositionTrack = composition.addMutableTrack(
-                    withMediaType: .audio,
-                    preferredTrackID: kCMPersistentTrackID_Invalid
-                  ) else {
-                continue
-            }
+        guard !inputParameters.isEmpty else { return false }
 
-            var cursor = CMTime.zero
-            var inserted = false
-            for segment in map.segments where segment.rate > 0 && segment.sourceLengthMs > 0 {
-                let sourceRange = CMTimeRange(
-                    start: CMTime(seconds: segment.sourceStartMs / 1000, preferredTimescale: 600),
-                    duration: CMTime(seconds: segment.sourceLengthMs / 1000, preferredTimescale: 600)
-                )
-                do {
-                    try compositionTrack.insertTimeRange(sourceRange, of: sourceTrack, at: cursor)
-                    let insertedDuration = CMTime(seconds: segment.sourceLengthMs / 1000, preferredTimescale: 600)
-                    let outputDuration = CMTime(seconds: segment.outputLengthMs / 1000, preferredTimescale: 600)
-                    if abs(segment.rate - 1) > 0.001, outputDuration > .zero {
-                        compositionTrack.scaleTimeRange(
-                            CMTimeRange(start: cursor, duration: insertedDuration),
-                            toDuration: outputDuration
-                        )
-                    }
-                    cursor = CMTimeAdd(cursor, outputDuration)
-                    inserted = true
-                } catch {
-                    NSLog("Audio insert failed (\(segment.sourceStartMs)–\(segment.sourceEndMs)): \(error.localizedDescription)")
-                }
-            }
-
-            if inserted {
-                insertedTracks += 1
-            } else {
-                composition.removeTrack(compositionTrack)
-            }
-        }
-
-        guard insertedTracks > 0 else { return false }
-
-        // Match the visual duration exactly, even if the audio source ran short.
+        // Match the visual duration exactly, even if every audio source ran short.
         let target = CMTime(seconds: outputDurationMs / 1000, preferredTimescale: 600)
         if CMTimeCompare(composition.duration, target) < 0 {
             if let last = composition.tracks(withMediaType: .audio).last {
@@ -473,6 +437,9 @@ public final class Exporter: @unchecked Sendable {
                 last.insertEmptyTimeRange(CMTimeRange(start: composition.duration, duration: missing))
             }
         }
+
+        let audioMix = AVMutableAudioMix()
+        audioMix.inputParameters = inputParameters
 
         guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else {
             throw ExportError.audioFailed("Could not create the audio export session.")
@@ -482,6 +449,7 @@ public final class Exporter: @unchecked Sendable {
         }
         session.outputURL = destination
         session.outputFileType = .m4a
+        session.audioMix = audioMix
         session.shouldOptimizeForNetworkUse = false
 
         nonisolated(unsafe) let exportSession = session
@@ -599,7 +567,33 @@ public final class Exporter: @unchecked Sendable {
         fps: Int,
         settings: ExportSettings
     ) -> [String: Any] {
-        let codec: AVVideoCodecType = settings.codec == .hevc ? .hevc : .h264
+        let codec: AVVideoCodecType
+        switch settings.codec {
+        case .h264: codec = .h264
+        case .hevc: codec = .hevc
+        case .proRes422LT: codec = .proRes422LT
+        case .proRes422: codec = .proRes422
+        case .proRes422HQ: codec = .proRes422HQ
+        case .proRes4444: codec = .proRes4444
+        }
+
+        let colorProperties: [String: Any] = [
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+        ]
+
+        if settings.codec.isProRes {
+            // ProRes is constant-quality by profile; AVFoundation rejects the generic
+            // `Quality` compression property for `apcs`/`apcn`/`apch`/`ap4h`.
+            return [
+                AVVideoCodecKey: codec,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoColorPropertiesKey: colorProperties
+            ]
+        }
+
         let bitsPerPixel = settings.codec == .hevc ? 0.11 : 0.16
         let rawBitrate = Double(width) * Double(height) * Double(fps) * bitsPerPixel * settings.quality
         let bitrate = Int(min(max(rawBitrate, 4_000_000), 160_000_000))
@@ -608,6 +602,7 @@ public final class Exporter: @unchecked Sendable {
             AVVideoCodecKey: codec,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
+            AVVideoColorPropertiesKey: colorProperties,
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: bitrate,
                 AVVideoMaxKeyFrameIntervalKey: fps * 2,

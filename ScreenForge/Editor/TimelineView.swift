@@ -11,10 +11,17 @@ struct TimelineView: View {
 
     private let inset: CGFloat = 14
     private let rulerHeight: CGFloat = 26
-    private let zoomLaneY: CGFloat = 36
-    private let noteLaneY: CGFloat = 72
-    private let speedLaneY: CGFloat = 104
-    private let height: CGFloat = 132
+    private let markerLaneY: CGFloat = 30
+    private let markerLaneHeight: CGFloat = 16
+    private let zoomLaneY: CGFloat = 50
+    private let zoomLaneHeight: CGFloat = 28
+    private let noteLaneY: CGFloat = 82
+    private let noteLaneHeight: CGFloat = 22
+    private let speedLaneY: CGFloat = 108
+    private let speedLaneHeight: CGFloat = 16
+    private let audioLaneY: CGFloat = 128
+    private let audioLaneHeight: CGFloat = 22
+    private let height: CGFloat = 158
 
     private var durationMs: Double {
         max(playback.durationMs, document.outputDurationMs, 1)
@@ -96,6 +103,8 @@ struct TimelineView: View {
                 legendDot(Theme.warning, "Speed")
                 legendDot(Color(hex: 0xB48CFF), "Note")
                 legendDot(Theme.success, "Layout")
+                legendDot(.yellow, "Marker")
+                legendDot(.teal, "Audio")
             }
 
             Divider()
@@ -148,12 +157,44 @@ struct TimelineView: View {
             .help("Cut tools")
 
             Button {
-                document.addTextAnnotation(atOutputMs: playback.outputTimeMs)
+                document.addMarker(
+                    atOutputMs: playback.outputTimeMs,
+                    label: "Marker \(document.project.timeline.markers.count + 1)"
+                )
+            } label: {
+                Image(systemName: "bookmark")
+            }
+            .buttonStyle(TimelineIconButtonStyle())
+            .help("Add a marker at the playhead (⌘M)")
+
+            Menu {
+                Button {
+                    document.addTextAnnotation(atOutputMs: playback.outputTimeMs)
+                } label: {
+                    Label("Text", systemImage: "textformat")
+                }
+                Button {
+                    document.addCalloutAnnotation(type: .highlight, atOutputMs: playback.outputTimeMs)
+                } label: {
+                    Label("Highlight", systemImage: "rectangle.dashed")
+                }
+                Button {
+                    document.addCalloutAnnotation(type: .blur, atOutputMs: playback.outputTimeMs)
+                } label: {
+                    Label("Mask", systemImage: "eye.slash")
+                }
+                Button {
+                    document.addCalloutAnnotation(type: .figure, atOutputMs: playback.outputTimeMs)
+                } label: {
+                    Label("Shape", systemImage: "square.on.circle")
+                }
             } label: {
                 Image(systemName: "text.bubble")
             }
-            .buttonStyle(TimelineIconButtonStyle())
-            .help("Add a text annotation at the playhead")
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 28)
+            .help("Add an annotation at the playhead")
         }
     }
 
@@ -175,9 +216,11 @@ struct TimelineView: View {
                 .frame(width: width + inset * 2, height: height)
                 .offset(x: 0, y: 0)
 
-            laneBackground(width: width, y: zoomLaneY, height: 30, tint: Theme.accent)
-            laneBackground(width: width, y: noteLaneY, height: 26, tint: Color(hex: 0xB48CFF))
-            laneBackground(width: width, y: speedLaneY, height: 20, tint: Theme.warning)
+            laneBackground(width: width, y: markerLaneY, height: markerLaneHeight, tint: .yellow)
+            laneBackground(width: width, y: zoomLaneY, height: zoomLaneHeight, tint: Theme.accent)
+            laneBackground(width: width, y: noteLaneY, height: noteLaneHeight, tint: Color(hex: 0xB48CFF))
+            laneBackground(width: width, y: speedLaneY, height: speedLaneHeight, tint: Theme.warning)
+            laneBackground(width: width, y: audioLaneY, height: audioLaneHeight, tint: .teal)
         }
     }
 
@@ -254,13 +297,13 @@ struct TimelineView: View {
         ForEach(document.project.timeline.zooms) { zoom in
             if let range = outputRange(sourceStart: zoom.startMs, sourceEnd: zoom.endMs) {
                 chip(
-                    title: String(format: "%.1f×", zoom.scale),
+                    title: zoomChipTitle(zoom),
                     color: Theme.accent,
                     selected: document.selectedZoomID == zoom.id,
                     startX: x(for: range.lowerBound, width: width),
                     chipWidth: chipWidth(range: range, width: width),
                     y: zoomLaneY + 3,
-                    chipHeight: 24,
+                    chipHeight: zoomLaneHeight - 6,
                     hovered: hoveredRegion == zoom.id
                 ) {
                     selectZoom(zoom.id)
@@ -287,8 +330,8 @@ struct TimelineView: View {
                     selected: document.selectedAnnotationID == annotation.id,
                     startX: x(for: range.lowerBound, width: width),
                     chipWidth: chipWidth(range: range, width: width),
-                    y: noteLaneY + 3,
-                    chipHeight: 20,
+                    y: noteLaneY + 2,
+                    chipHeight: noteLaneHeight - 4,
                     hovered: hoveredRegion == annotation.id
                 ) {
                     selectAnnotation(annotation.id)
@@ -317,8 +360,8 @@ struct TimelineView: View {
                     selected: document.selectedSpeedID == speed.id,
                     startX: x(for: range.lowerBound, width: width),
                     chipWidth: chipWidth(range: range, width: width),
-                    y: speedLaneY + 2,
-                    chipHeight: 16,
+                    y: speedLaneY + 1,
+                    chipHeight: speedLaneHeight - 2,
                     hovered: hoveredRegion == speed.id
                 ) {
                     selectSpeed(speed.id)
@@ -336,6 +379,86 @@ struct TimelineView: View {
                 .onHover { hoveredRegion = $0 ? speed.id : (hoveredRegion == speed.id ? nil : hoveredRegion) }
             }
         }
+
+        // Audio clips are already in output time, so they map 1:1.
+        ForEach(document.project.timeline.audioClips) { clip in
+            let start = x(for: Double(clip.startMs), width: width)
+            let end = x(for: Double(clip.endMs), width: width)
+            chip(
+                title: clip.muted ? "\(clip.label) (muted)" : clip.label,
+                color: audioColor(clip.kind),
+                selected: document.selectedAudioClipID == clip.id,
+                startX: start,
+                chipWidth: max(end - start, 30),
+                y: audioLaneY + 2,
+                chipHeight: audioLaneHeight - 4,
+                hovered: hoveredRegion == clip.id
+            ) {
+                selectAudioClip(clip.id)
+            } onDoubleTap: {
+                playback.seek(toOutputMs: Double(clip.startMs))
+            } menu: {
+                Button("Go to start") { playback.seek(toOutputMs: Double(clip.startMs)) }
+                Button(clip.muted ? "Unmute" : "Mute") {
+                    document.apply { project in
+                        guard let index = project.timeline.audioClips.firstIndex(where: { $0.id == clip.id }) else { return }
+                        project.timeline.audioClips[index].muted.toggle()
+                    }
+                }
+                Button("Delete clip", role: .destructive) {
+                    document.deleteAudioClip(id: clip.id)
+                }
+            }
+            .onHover { hoveredRegion = $0 ? clip.id : (hoveredRegion == clip.id ? nil : hoveredRegion) }
+        }
+
+        ForEach(document.project.timeline.markers) { marker in
+            markerPin(marker, width: width)
+        }
+    }
+
+    private func zoomChipTitle(_ zoom: ZoomRegion) -> String {
+        let scale = String(format: "%.1f×", zoom.scale)
+        return zoom.kind == .loupe ? "◎ \(scale)" : scale
+    }
+
+    private func audioColor(_ kind: AudioClipKind) -> Color {
+        switch kind {
+        case .voiceover: .teal
+        case .music: Color(hex: 0x5AC8FA)
+        case .soundEffect: Color(hex: 0xFF9F0A)
+        case .external: Color(hex: 0x8E8E93)
+        }
+    }
+
+    private func markerPin(_ marker: TimelineMarker, width: CGFloat) -> some View {
+        let selected = document.selectedMarkerID == marker.id
+        return VStack(spacing: 0) {
+            Image(systemName: marker.kind.symbol)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(selected ? .black : Color(hexString: marker.colorHex))
+                .frame(width: 14, height: 14)
+                .background(
+                    Circle().fill(selected ? Color(hexString: marker.colorHex) : Color.black.opacity(0.55))
+                )
+            Rectangle()
+                .fill(Color(hexString: marker.colorHex).opacity(0.8))
+                .frame(width: 1, height: markerLaneHeight - 12)
+        }
+        .frame(width: 16)
+        .offset(
+            x: x(for: Double(marker.timeMs), width: width) - 8,
+            y: markerLaneY - 1
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { selectMarker(marker.id) }
+        .contextMenu {
+            Button("Go to marker") { playback.seek(toOutputMs: Double(marker.timeMs)) }
+            Button("Delete marker", role: .destructive) {
+                document.deleteMarker(id: marker.id)
+            }
+        }
+        .help("\(marker.kind.label) · \(marker.label) · \(timeLabel(Double(marker.timeMs)))")
     }
 
     private func chip<T: View>(
@@ -406,6 +529,8 @@ struct TimelineView: View {
         document.selectedSpeedID = nil
         document.selectedLayoutID = nil
         document.selectedTrimID = nil
+        document.selectedMarkerID = nil
+        document.selectedAudioClipID = nil
     }
 
     private func selectAnnotation(_ id: String) {
@@ -414,6 +539,8 @@ struct TimelineView: View {
         document.selectedSpeedID = nil
         document.selectedLayoutID = nil
         document.selectedTrimID = nil
+        document.selectedMarkerID = nil
+        document.selectedAudioClipID = nil
     }
 
     private func selectSpeed(_ id: String) {
@@ -422,6 +549,28 @@ struct TimelineView: View {
         document.selectedAnnotationID = nil
         document.selectedLayoutID = nil
         document.selectedTrimID = nil
+        document.selectedMarkerID = nil
+        document.selectedAudioClipID = nil
+    }
+
+    private func selectMarker(_ id: String) {
+        document.selectedMarkerID = id
+        document.selectedZoomID = nil
+        document.selectedAnnotationID = nil
+        document.selectedSpeedID = nil
+        document.selectedLayoutID = nil
+        document.selectedTrimID = nil
+        document.selectedAudioClipID = nil
+    }
+
+    private func selectAudioClip(_ id: String) {
+        document.selectedAudioClipID = id
+        document.selectedZoomID = nil
+        document.selectedAnnotationID = nil
+        document.selectedSpeedID = nil
+        document.selectedLayoutID = nil
+        document.selectedTrimID = nil
+        document.selectedMarkerID = nil
     }
 
     // MARK: - Mapping

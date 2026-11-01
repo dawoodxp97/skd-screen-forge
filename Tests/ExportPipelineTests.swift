@@ -343,6 +343,266 @@ struct ExportPipelineTests {
         #expect(abs(CMTimeGetSeconds(duration) - 1.0) < 0.15)
     }
 
+    @Test("An external audio track is mixed with the microphone")
+    func exportWithExternalAudio() async throws {
+        guard isHosted, let device = MTLCreateSystemDefaultDevice() else { return }
+        let compositor = try Compositor(device: device)
+
+        let bundle = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgeExternal-\(UUID().uuidString).sforge", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: bundle) }
+
+        let store = ProjectStore.shared
+        try await store.createBundle(at: bundle)
+        let media = bundle.appendingPathComponent(ProjectBundleLayout.mediaDirectory, isDirectory: true)
+        try writeScreenMovie(to: media.appendingPathComponent("screen.mov"), seconds: 1.0)
+
+        let toneSource = bundle.deletingLastPathComponent()
+            .appendingPathComponent("external-\(UUID().uuidString).m4a")
+        try writeTone(to: toneSource, seconds: 1.0)
+        defer { try? FileManager.default.removeItem(at: toneSource) }
+
+        var project = ScreenForgeProject(
+            source: SourceInfo(
+                screenPath: "media/screen.mov",
+                externalAudioPath: "media/external.m4a",
+                durationMs: 1_000,
+                pixelWidth: 320,
+                pixelHeight: 320
+            )
+        )
+        project.export = ExportSettings(resolution: .p720, fps: 30, codec: .h264, quality: 0.4)
+        project.audio.externalVolume = 0.7
+        try await store.save(project, to: bundle)
+        try await store.importMedia(from: toneSource, into: bundle, preferredName: "external.m4a")
+
+        let output = bundle.deletingLastPathComponent()
+            .appendingPathComponent("ScreenForgeExternal-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        let exporter = Exporter(compositor: compositor)
+        _ = try await exporter.export(
+            job: ExportJob(project: project, bundleURL: bundle, outputURL: output)
+        ) { _ in }
+
+        let asset = AVURLAsset(url: output)
+        let audio = try await asset.loadTracks(withMediaType: .audio)
+        #expect(audio.count >= 1)
+    }
+
+    @Test("ProRes export writes a .mov with the requested profile")
+    func exportProRes() async throws {
+        guard isHosted, let device = MTLCreateSystemDefaultDevice() else { return }
+        let compositor = try Compositor(device: device)
+
+        let bundle = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgeProRes-\(UUID().uuidString).sforge", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: bundle) }
+
+        let store = ProjectStore.shared
+        try await store.createBundle(at: bundle)
+        let media = bundle.appendingPathComponent(ProjectBundleLayout.mediaDirectory, isDirectory: true)
+        try writeScreenMovie(to: media.appendingPathComponent("screen.mov"), seconds: 0.6)
+
+        var project = ScreenForgeProject(
+            source: SourceInfo(
+                screenPath: "media/screen.mov",
+                durationMs: 600,
+                pixelWidth: 320,
+                pixelHeight: 320
+            )
+        )
+        project.export = ExportSettings(
+            resolution: .p720,
+            fps: 30,
+            codec: .proRes422LT,
+            quality: 1
+        )
+        try await store.save(project, to: bundle)
+
+        let output = bundle.deletingLastPathComponent()
+            .appendingPathComponent("ScreenForgeProRes-\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        let exporter = Exporter(compositor: compositor)
+        _ = try await exporter.export(
+            job: ExportJob(project: project, bundleURL: bundle, outputURL: output)
+        ) { _ in }
+
+        #expect(output.pathExtension == "mov")
+        let asset = AVURLAsset(url: output)
+        let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
+        let formats = try await track.load(.formatDescriptions)
+        let subtype = formats.first.map { CMFormatDescriptionGetMediaSubType($0) }
+        #expect(subtype == kCMVideoCodecType_AppleProRes422LT)
+        let natural = try await track.load(.naturalSize)
+        #expect(natural.width == 1_280)
+    }
+
+    @Test("An imported music clip is mixed into the exported movie")
+    func exportWithMusicClip() async throws {
+        guard isHosted, let device = MTLCreateSystemDefaultDevice() else { return }
+        let compositor = try Compositor(device: device)
+
+        let bundle = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgeMusic-\(UUID().uuidString).sforge", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: bundle) }
+
+        let store = ProjectStore.shared
+        try await store.createBundle(at: bundle)
+        let media = bundle.appendingPathComponent(ProjectBundleLayout.mediaDirectory, isDirectory: true)
+        try writeScreenMovie(to: media.appendingPathComponent("screen.mov"), seconds: 1.0)
+
+        let toneSource = bundle.deletingLastPathComponent()
+            .appendingPathComponent("music-\(UUID().uuidString).m4a")
+        try writeTone(to: toneSource, seconds: 1.0)
+        defer { try? FileManager.default.removeItem(at: toneSource) }
+
+        var project = ScreenForgeProject(
+            source: SourceInfo(
+                screenPath: "media/screen.mov",
+                durationMs: 1_000,
+                pixelWidth: 320,
+                pixelHeight: 320
+            ),
+            timeline: Timeline(
+                audioClips: [
+                    AudioClip(
+                        kind: .music,
+                        path: "media/music.m4a",
+                        startMs: 100,
+                        durationMs: 700,
+                        fadeInMs: 200,
+                        fadeOutMs: 200
+                    )
+                ]
+            )
+        )
+        project.export = ExportSettings(resolution: .p720, fps: 30, codec: .h264, quality: 0.4)
+        project.audio.musicVolume = 0.6
+        try await store.save(project, to: bundle)
+        try await store.importMedia(from: toneSource, into: bundle, preferredName: "music.m4a")
+
+        let output = bundle.deletingLastPathComponent()
+            .appendingPathComponent("ScreenForgeMusic-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        let exporter = Exporter(compositor: compositor)
+        _ = try await exporter.export(
+            job: ExportJob(project: project, bundleURL: bundle, outputURL: output)
+        ) { _ in }
+
+        let asset = AVURLAsset(url: output)
+        let audio = try await asset.loadTracks(withMediaType: .audio)
+        #expect(audio.count >= 1)
+        let duration = try await asset.load(.duration)
+        #expect(abs(CMTimeGetSeconds(duration) - 1.0) < 0.15)
+    }
+
+    @Test("Preview composition carries the same clip mix as export")
+    func previewAudioMix() async throws {
+        guard isHosted else { return }
+
+        let bundle = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgePreview-\(UUID().uuidString).sforge", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: bundle) }
+
+        let store = ProjectStore.shared
+        try await store.createBundle(at: bundle)
+        let media = bundle.appendingPathComponent(ProjectBundleLayout.mediaDirectory, isDirectory: true)
+        try writeScreenMovie(to: media.appendingPathComponent("screen.mov"), seconds: 1.0)
+
+        let toneSource = bundle.deletingLastPathComponent()
+            .appendingPathComponent("preview-\(UUID().uuidString).m4a")
+        try writeTone(to: toneSource, seconds: 1.0)
+        defer { try? FileManager.default.removeItem(at: toneSource) }
+
+        let project = ScreenForgeProject(
+            source: SourceInfo(
+                screenPath: "media/screen.mov",
+                durationMs: 1_000,
+                pixelWidth: 320,
+                pixelHeight: 320
+            ),
+            timeline: Timeline(
+                audioClips: [
+                    AudioClip(
+                        kind: .music,
+                        path: "media/music.m4a",
+                        startMs: 200,
+                        durationMs: 600,
+                        fadeInMs: 100,
+                        fadeOutMs: 100
+                    )
+                ]
+            )
+        )
+        try await store.save(project, to: bundle)
+        try await store.importMedia(from: toneSource, into: bundle, preferredName: "music.m4a")
+
+        let preview = try await PreviewCompositionBuilder.makePreview(
+            project: project,
+            bundleURL: bundle
+        )
+        #expect(preview.composition.tracks(withMediaType: .video).count == 1)
+        #expect(preview.composition.tracks(withMediaType: .audio).count >= 1)
+        #expect(preview.audioMix?.inputParameters.count == preview.composition.tracks(withMediaType: .audio).count)
+    }
+
+    @Test("Chapter markers are written into the exported container")
+    func exportChapters() async throws {
+        guard isHosted, let device = MTLCreateSystemDefaultDevice() else { return }
+        let compositor = try Compositor(device: device)
+
+        let bundle = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ScreenForgeChapters-\(UUID().uuidString).sforge", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: bundle) }
+
+        let store = ProjectStore.shared
+        try await store.createBundle(at: bundle)
+        let media = bundle.appendingPathComponent(ProjectBundleLayout.mediaDirectory, isDirectory: true)
+        try writeScreenMovie(to: media.appendingPathComponent("screen.mov"), seconds: 1.0)
+
+        var project = ScreenForgeProject(
+            source: SourceInfo(
+                screenPath: "media/screen.mov",
+                durationMs: 1_000,
+                pixelWidth: 320,
+                pixelHeight: 320
+            ),
+            timeline: Timeline(markers: [
+                TimelineMarker(timeMs: 0, label: "Intro", kind: .chapter),
+                TimelineMarker(timeMs: 500, label: "Demo", kind: .chapter)
+            ])
+        )
+        project.export = ExportSettings(resolution: .p720, fps: 30, codec: .h264, quality: 0.4)
+        try await store.save(project, to: bundle)
+
+        let output = bundle.deletingLastPathComponent()
+            .appendingPathComponent("ScreenForgeChapters-\(UUID().uuidString).mp4")
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        let exporter = Exporter(compositor: compositor)
+        _ = try await exporter.export(
+            job: ExportJob(project: project, bundleURL: bundle, outputURL: output)
+        ) { _ in }
+
+        let chapters = try ChapterWriter.readChapters(from: output)
+        #expect(chapters.count == 2)
+        #expect(chapters.map(\.title) == ["Intro", "Demo"])
+        #expect(chapters.map(\.timeMs) == [0, 500])
+
+        // Fast-start files put moov before mdat; chapter insertion must rebase
+        // chunk offsets or every frame after the edit point fails to decode.
+        let assetAfterChapters = AVURLAsset(url: output)
+        let generator = AVAssetImageGenerator(asset: assetAfterChapters)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let frame = try generator.copyCGImage(at: CMTime(seconds: 0.25, preferredTimescale: 600), actualTime: nil)
+        #expect(frame.width == 1_280)
+    }
+
     @Test("GIF export writes animatable frames")
     func exportGIF() async throws {
         guard isHosted, let device = MTLCreateSystemDefaultDevice() else { return }

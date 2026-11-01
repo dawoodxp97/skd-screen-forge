@@ -378,6 +378,8 @@ public struct AnnotationRegion: Codable, Sendable, Equatable, Identifiable {
     public var style: AnnotationStyle
     public var zIndex: Int
     public var mask: MaskSettings?
+    /// True for masks created by the automatic sensitive-data/face scanner.
+    public var generated: Bool?
 
     public init(
         id: String = UUID().uuidString,
@@ -389,7 +391,8 @@ public struct AnnotationRegion: Codable, Sendable, Equatable, Identifiable {
         rect: NormalizedRect = NormalizedRect(),
         style: AnnotationStyle = .default,
         zIndex: Int = 1,
-        mask: MaskSettings? = nil
+        mask: MaskSettings? = nil,
+        generated: Bool? = nil
     ) {
         self.id = id
         self.type = type
@@ -401,6 +404,7 @@ public struct AnnotationRegion: Codable, Sendable, Equatable, Identifiable {
         self.style = style
         self.zIndex = zIndex
         self.mask = mask
+        self.generated = generated
     }
 
     public var durationMs: Int { max(0, endMs - startMs) }
@@ -458,6 +462,152 @@ public struct TranscriptEdit: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+// MARK: - Timeline markers / audio tracks
+
+public enum TimelineMarkerKind: String, Codable, Sendable, CaseIterable {
+    case marker
+    case flag
+    case chapter
+
+    public var label: String {
+        switch self {
+        case .marker: "Marker"
+        case .flag: "Flag"
+        case .chapter: "Chapter"
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .marker: "bookmark.fill"
+        case .flag: "flag.fill"
+        case .chapter: "list.bullet.rectangle"
+        }
+    }
+}
+
+/// A lightweight point on the **output** timeline. Markers recorded live are
+/// carried into the project and can later become chapters or export cue points.
+public struct TimelineMarker: Codable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var timeMs: Int
+    public var label: String
+    public var kind: TimelineMarkerKind
+    public var colorHex: String
+
+    public init(
+        id: String = UUID().uuidString,
+        timeMs: Int,
+        label: String = "Marker",
+        kind: TimelineMarkerKind = .marker,
+        colorHex: String = "#FFD60A"
+    ) {
+        self.id = id
+        self.timeMs = timeMs
+        self.label = label
+        self.kind = kind
+        self.colorHex = colorHex
+    }
+
+    public func clamped(toDuration durationMs: Int) -> TimelineMarker {
+        var copy = self
+        copy.timeMs = min(max(timeMs, 0), max(durationMs, 0))
+        if copy.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            copy.label = copy.kind.label
+        }
+        return copy
+    }
+}
+
+public enum AudioClipKind: String, Codable, Sendable, CaseIterable {
+    case voiceover
+    case music
+    case soundEffect
+    case external
+
+    public var label: String {
+        switch self {
+        case .voiceover: "Voiceover"
+        case .music: "Music"
+        case .soundEffect: "Sound effect"
+        case .external: "Audio"
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .voiceover: "waveform.circle.fill"
+        case .music: "music.note"
+        case .soundEffect: "sparkles"
+        case .external: "speaker.wave.2.fill"
+        }
+    }
+}
+
+/// A free-standing audio clip placed on the **output** timeline. Voiceover,
+/// background music, and sound effects all use this model. `startMs` is output
+/// time so clips stay attached to the visible edit when cuts or speed changes
+/// are applied underneath them.
+public struct AudioClip: Codable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var kind: AudioClipKind
+    /// Bundle-relative path, e.g. `media/music-loop.m4a`.
+    public var path: String
+    public var label: String
+    public var startMs: Int
+    public var durationMs: Int
+    public var sourceStartMs: Int
+    /// Linear gain, 0...2 (1 = unity).
+    public var volume: Double
+    public var fadeInMs: Int
+    public var fadeOutMs: Int
+    /// Repeat the source until `durationMs` is filled.
+    public var loops: Bool
+    public var muted: Bool
+
+    public init(
+        id: String = UUID().uuidString,
+        kind: AudioClipKind = .music,
+        path: String,
+        label: String? = nil,
+        startMs: Int = 0,
+        durationMs: Int,
+        sourceStartMs: Int = 0,
+        volume: Double = 1,
+        fadeInMs: Int = 0,
+        fadeOutMs: Int = 0,
+        loops: Bool = false,
+        muted: Bool = false
+    ) {
+        self.id = id
+        self.kind = kind
+        self.path = path
+        self.label = label ?? kind.label
+        self.startMs = startMs
+        self.durationMs = durationMs
+        self.sourceStartMs = sourceStartMs
+        self.volume = volume
+        self.fadeInMs = fadeInMs
+        self.fadeOutMs = fadeOutMs
+        self.loops = loops
+        self.muted = muted
+    }
+
+    public var endMs: Int { startMs + durationMs }
+
+    public func clamped(toDuration timelineDurationMs: Int) -> AudioClip {
+        var copy = self
+        copy.startMs = min(max(startMs, 0), max(timelineDurationMs, 0))
+        let maximum = max(timelineDurationMs - copy.startMs, 0)
+        copy.durationMs = min(max(durationMs, 0), maximum)
+        copy.sourceStartMs = max(sourceStartMs, 0)
+        copy.volume = min(max(volume, 0), 2)
+        copy.fadeInMs = min(max(fadeInMs, 0), copy.durationMs)
+        copy.fadeOutMs = min(max(fadeOutMs, 0), copy.durationMs - copy.fadeInMs)
+        return copy
+    }
+}
+
 // MARK: - Timeline
 
 public struct Timeline: Codable, Sendable, Equatable {
@@ -467,6 +617,8 @@ public struct Timeline: Codable, Sendable, Equatable {
     public var annotations: [AnnotationRegion]
     public var layouts: [LayoutRegion]
     public var transcriptEdits: [TranscriptEdit]
+    public var markers: [TimelineMarker]
+    public var audioClips: [AudioClip]
     /// Master switch for magic-wand suggestions.
     public var autoZoomEnabled: Bool
     /// Flip every zoom between cursor-follow and fixed focus.
@@ -479,6 +631,8 @@ public struct Timeline: Codable, Sendable, Equatable {
         annotations: [AnnotationRegion] = [],
         layouts: [LayoutRegion] = [],
         transcriptEdits: [TranscriptEdit] = [],
+        markers: [TimelineMarker] = [],
+        audioClips: [AudioClip] = [],
         autoZoomEnabled: Bool = true,
         autoFocusEnabled: Bool = false
     ) {
@@ -488,8 +642,31 @@ public struct Timeline: Codable, Sendable, Equatable {
         self.annotations = annotations
         self.layouts = layouts
         self.transcriptEdits = transcriptEdits
+        self.markers = markers
+        self.audioClips = audioClips
         self.autoZoomEnabled = autoZoomEnabled
         self.autoFocusEnabled = autoFocusEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case zooms, trims, speeds, annotations, layouts, transcriptEdits
+        case markers, audioClips, autoZoomEnabled, autoFocusEnabled
+    }
+
+    /// Missing marker/audio keys decode to empty arrays so projects created by
+    /// earlier ScreenForge builds keep opening without a migration prompt.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        zooms = try container.decodeIfPresent([ZoomRegion].self, forKey: .zooms) ?? []
+        trims = try container.decodeIfPresent([TrimRegion].self, forKey: .trims) ?? []
+        speeds = try container.decodeIfPresent([SpeedRegion].self, forKey: .speeds) ?? []
+        annotations = try container.decodeIfPresent([AnnotationRegion].self, forKey: .annotations) ?? []
+        layouts = try container.decodeIfPresent([LayoutRegion].self, forKey: .layouts) ?? []
+        transcriptEdits = try container.decodeIfPresent([TranscriptEdit].self, forKey: .transcriptEdits) ?? []
+        markers = try container.decodeIfPresent([TimelineMarker].self, forKey: .markers) ?? []
+        audioClips = try container.decodeIfPresent([AudioClip].self, forKey: .audioClips) ?? []
+        autoZoomEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoZoomEnabled) ?? true
+        autoFocusEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoFocusEnabled) ?? false
     }
 
     public static let empty = Timeline()
@@ -517,6 +694,12 @@ public struct Timeline: Codable, Sendable, Equatable {
             .filter { $0.endMs > $0.startMs }
             .sorted { $0.startMs < $1.startMs }
         copy.transcriptEdits = transcriptEdits.sorted { $0.startMs < $1.startMs }
+        // Markers and clips are output-time objects; `ScreenForgeProject.normalized`
+        // clamps them once the output duration is known.
+        copy.markers = markers.sorted { $0.timeMs < $1.timeMs }
+        copy.audioClips = audioClips
+            .filter { $0.durationMs > 0 && !$0.path.isEmpty }
+            .sorted { $0.startMs < $1.startMs }
         return copy
     }
 
@@ -533,6 +716,10 @@ public struct Timeline: Codable, Sendable, Equatable {
 
     public func annotations(at ms: Int) -> [AnnotationRegion] {
         annotations.filter { ms >= $0.startMs && ms <= $0.endMs }
+    }
+
+    public func markers(at ms: Int, toleranceMs: Int = 40) -> [TimelineMarker] {
+        markers.filter { abs($0.timeMs - ms) <= toleranceMs }
     }
 }
 

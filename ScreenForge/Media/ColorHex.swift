@@ -13,6 +13,13 @@ public enum ColorHex {
         return SIMD4<Float>(parsed.0, parsed.1, parsed.2, parsed.3 * alpha)
     }
 
+    /// Multiplies RGB toward black; returns an opaque color.
+    public static func darkened(_ hex: String, by amount: Float) -> SIMD4<Float> {
+        let parsed = parse(hex)
+        let factor = min(max(1 - amount, 0), 1)
+        return SIMD4<Float>(parsed.0 * factor, parsed.1 * factor, parsed.2 * factor, 1)
+    }
+
     public static func cgColor(_ hex: String, alpha: CGFloat = 1) -> CGColor {
         let parsed = parse(hex)
         return CGColor(

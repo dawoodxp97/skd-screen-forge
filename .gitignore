@@ -1,31 +1,81 @@
+# ---------------------------------------------------------------------------
+# Secrets / local configuration
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+secrets/
+credentials.json
+
+# ---------------------------------------------------------------------------
+# macOS
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.AppleDouble
+.LSOverride
+
+# ---------------------------------------------------------------------------
 # Xcode
+# ---------------------------------------------------------------------------
 build/
 DerivedData/
 *.xcodeproj
 *.xcworkspace
 xcuserdata/
 *.xcuserstate
-
-# macOS
-.DS_Store
+*.xcscmblueprint
+*.xccheckout
+*.xcresult
+*.hmap
+*.ipa
 *.dSYM
 *.dSYM.zip
+*.moved-aside
 
-# SwiftPM
+# ---------------------------------------------------------------------------
+# Swift Package Manager
+# ---------------------------------------------------------------------------
 .build/
 .swiftpm/
 Package.resolved
 
-# App artifacts
+# ---------------------------------------------------------------------------
+# Build / packaging output
+# ---------------------------------------------------------------------------
+dist/
+out/
 *.dmg
 *.pkg
 *.app
+
+# ---------------------------------------------------------------------------
+# App artifacts and local recordings / fixtures
+# ---------------------------------------------------------------------------
 *.sforge
-
-# Local recordings / fixtures
 Recordings/
+TestRecordings/
 Fixtures/Local/
+*.log
+logs/
 
-# Env
-.env
-.env.*
+# ---------------------------------------------------------------------------
+# Editors / tooling
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.netrignore
